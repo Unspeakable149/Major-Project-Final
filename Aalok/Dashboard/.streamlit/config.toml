@@ -1,0 +1,12 @@
+# Dashboard theme — Anthropic dark: warm near-black, cream text, terracotta accent.
+# Custom typography and component styling live in the CSS block in app.py.
+[theme]
+base = "dark"
+primaryColor = "#D97757"
+backgroundColor = "#141413"
+secondaryBackgroundColor = "#1F1E1C"
+textColor = "#FAF9F5"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

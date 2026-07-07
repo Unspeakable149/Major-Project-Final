@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Claude Code local settings (contain absolute paths / usernames)
+.claude/
+
+# Runtime artifacts
+ids_logs.db
+retrain_state.json
+
+# Packet captures (may contain local network data)
+*.pcap
+
+# Personal academic documents
+Aalok/Weeks/
