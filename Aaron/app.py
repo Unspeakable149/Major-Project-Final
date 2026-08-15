@@ -2,6 +2,8 @@ import os
 import sqlite3
 import subprocess
 import time
+import io
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -417,12 +419,86 @@ with tab1:
                 csv_bytes = filtered_df.drop(
                     columns=[c for c in ("id",) if c in filtered_df.columns]
                 ).to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="Export Filtered Logs (CSV)",
-                    data=csv_bytes,
-                    file_name=f"ids_threat_logs_{int(time.time())}.csv",
-                    mime="text/csv",
-                )
+
+                # Always offer the current live capture if present.
+                live_pcap = "temp_live.pcap"
+                if os.path.exists(live_pcap):
+                    try:
+                        # Wait for the file size to stabilize, then copy to a temp file
+                        import shutil, tempfile
+
+                        last_size = -1
+                        stable_count = 0
+                        for _ in range(20):
+                            try:
+                                size = os.path.getsize(live_pcap)
+                            except OSError:
+                                size = -1
+                            if size == last_size and size > 0:
+                                stable_count += 1
+                            else:
+                                stable_count = 0
+                            if stable_count >= 2:
+                                break
+                            last_size = size
+                            time.sleep(0.1)
+
+                        tmp = tempfile.NamedTemporaryFile(delete=False)
+                        tmp.close()
+                        shutil.copy2(live_pcap, tmp.name)
+                        with open(tmp.name, "rb") as fh:
+                            live_bytes = fh.read()
+                        try:
+                            os.remove(tmp.name)
+                        except Exception:
+                            pass
+
+                        st.download_button(
+                            label="Download current capture (PCAP)",
+                            data=live_bytes,
+                            file_name=f"temp_live_{int(time.time())}.pcap",
+                            mime="application/vnd.tcpdump.pcap",
+                            key="live_pcap_dl",
+                        )
+                    except Exception:
+                        st.caption("Live PCAP currently unavailable")
+
+                pcap_paths = []
+                if "Evidence Path" in filtered_df.columns:
+                    pcap_paths = [p for p in filtered_df["Evidence Path"].dropna().unique()]
+                existing_pcaps = [p for p in pcap_paths if os.path.exists(p)]
+
+                if len(existing_pcaps) == 1:
+                    p = existing_pcaps[0]
+                    with open(p, "rb") as fh:
+                        st.download_button(
+                            label="Download PCAP",
+                            data=fh.read(),
+                            file_name=os.path.basename(p),
+                            mime="application/vnd.tcpdump.pcap",
+                        )
+                elif len(existing_pcaps) > 1:
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w") as zf:
+                        for p in existing_pcaps:
+                            try:
+                                zf.write(p, arcname=os.path.basename(p))
+                            except Exception:
+                                pass
+                    buf.seek(0)
+                    st.download_button(
+                        label=f"Download {len(existing_pcaps)} PCAPs (zip)",
+                        data=buf.getvalue(),
+                        file_name=f"ids_evidence_pcaps_{int(time.time())}.zip",
+                        mime="application/zip",
+                    )
+                else:
+                    st.download_button(
+                        label="Export Filtered Logs (CSV)",
+                        data=csv_bytes,
+                        file_name=f"ids_threat_logs_{int(time.time())}.csv",
+                        mime="text/csv",
+                    )
 
                 # ── PCAP Evidence Downloads ───────────────────────────────────
                 if "Evidence Path" in logs_df.columns:

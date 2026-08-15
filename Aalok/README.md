@@ -167,9 +167,9 @@ Attack the gateway router (not the host machine) - VirtualBox's bridge driver ro
 | Alert logging & dashboard | Done |
 | Evaluation against benchmark dataset | Done (`evaluate_benchmark.py`) |
 | Active response (firewall rule push) | Done (Optional v2) |
-| LSTM behavioral model | Pending (Optional v2) |
-| SHAP explainability | Pending (Optional v2) |
-| Model retraining pipeline | Pending (Optional v2) |
+| LSTM behavioral model | Done (Optional v2) — Layer 5 of the fusion engine, capped contribution |
+| SHAP explainability | Done (Optional v2) — RF (TreeExplainer) + LSTM (GradientExplainer) |
+| Model retraining pipeline | Done (Optional v2) — versioned RF + LSTM with rollback |
 
 ## Note on Label Source
 

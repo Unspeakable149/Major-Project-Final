@@ -1,18 +1,105 @@
-# Python cache
+# The working tree this repository lives in also holds coursework, recordings and
+# build output that must never be published. The rules below are deny-by-default
+# for whole categories; anything that genuinely belongs in the repo and collides
+# with a rule is un-ignored explicitly, so adding a file is always a deliberate
+# act rather than a side effect of leaving it in a folder.
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.venv/
+venv/
+env/
 
-# Claude Code local settings (contain absolute paths / usernames)
+# ── Tooling / IDE / OS ───────────────────────────────────────────────────────
 .claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
 
-# Runtime artifacts
-ids_logs.db
-retrain_state.json
-
-# Packet captures (may contain local network data)
+# ── Runtime artifacts: real captured traffic and real classifications ────────
+# An alert database is a log of actual network activity on the machine that ran
+# it, and a capture carries payloads (this project's own test captures include
+# /etc/passwd dumps and SSH sessions). Neither is publishable.
+*.db
+*.db.demo-backup
 *.pcap
+*.pcapng
+live_threat_logs.csv
+temp_raw.csv
+retrain_state.json
+launcher.log
 
-# Personal academic documents
+# Evidence captures auto-saved by the dashboard — named after real remote IPs
+Aalok/Dashboard/evidence/
+
+# ── Credentials and operator-specific config ─────────────────────────────────
+# Only the .example templates are published; see SECURITY.md.
+notifier_config.json
+baseline.txt
+
+# ── Training data and model snapshots ────────────────────────────────────────
+# Large, regenerable, and derived from real captures. The one exception is
+# ai_ready_advanced_flows.csv, un-ignored below: reproduce_spec_metrics.py needs
+# it, and its Source IP column has been pseudonymised.
+Aalok/Dashboard/master_behavioral_dataset.csv
+Aalok/Dashboard/master_advanced_dataset.csv
+Aalok/Dashboard/model_versions/
+Aalok/Dashboard/Bulk PCAPS/
+Aalok/Dashboard/Temp_CSVs/
+Aalok/Dashboard/archive*/
+*.preanon-backup
+
+# ── Build output ─────────────────────────────────────────────────────────────
+build/
+build_test/
+dist/
+dist_test/
+installer/output/
+*.spec.bak
+Hybrid IDS/
+
+# Distribution bundles — published as GitHub Release assets, not as repo files.
+# The .exe alone is ~380 MB, well past GitHub's 100 MB per-file limit.
+HybridIDS-Code-Share/
+HybridIDS-.exe-Share/
+*.zip
+*.exe
+
+# ── Coursework, personal and internal project material ───────────────────────
+# None of this belongs in a public code repository.
 Aalok/Weeks/
+Aalok/Final Report and Slides/
+Backup/
+claude memory file/
+*.mp4
+*.pptx
+*.docx
+*.pdf
+CLAUDE.md
+changes.txt
+mp delivirable.txt
+HOW TO USE.txt
+WEEKLY_JOURNALS*.md
+Major_Project_Direction*
+Teaching Plan*
+image.png
+image (*).png
+
+# ── Un-ignored: shipped artifacts that collide with the rules above ──────────
+# Trained models the app loads at runtime. Without these a fresh clone starts
+# with no classifier and silently falls back to the K-Means model.
+!Aalok/Dashboard/rf_model.pkl
+!Aalok/Dashboard/rf_scaler.pkl
+!Aalok/Dashboard/advanced_data_scaler.pkl
+!Aalok/Dashboard/advanced_kmeans_model.pkl
+!Aalok/Dashboard/lstm_model.pt
+!Rui Yang/models/*.pkl
+
+# Evidence behind the published metrics.
+!Aalok/Dashboard/ai_ready_advanced_flows.csv
+!Aalok/TEST_RESULTS.md

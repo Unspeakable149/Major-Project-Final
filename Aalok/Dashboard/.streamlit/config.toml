@@ -10,3 +10,11 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+# Bind to loopback only. The dashboard must never be reachable from the LAN or
+# the internet — it exposes live capture data and admin controls with no auth.
+[server]
+address = "127.0.0.1"
+headless = true
+enableCORS = true
+enableXsrfProtection = true

@@ -1,0 +1,64 @@
+{
+  "_meta": {
+    "source": "C:\\HybridIDPS\\data\\cleaned\\cleaned_full_dataset.csv",
+    "normal_traffic_rows": 2094896,
+    "normal_traffic_rate_filtered_rows": 277848,
+    "method": "For validated_* entries: threshold sits MARGIN_PCT_POINTS below the percentile rank of a real, already-classified-correctly synthetic attack sample within Normal Traffic. For unvalidated entries: fixed p99.5 (pps/bytes) or p90 (packet count) of Normal Traffic, no attack-sample anchor available this session.",
+    "validated": {
+      "port_scan_pps_floor": {
+        "test_value": 5008,
+        "test_percentile_rank": 99.78
+      },
+      "web_attack_pps_floor": {
+        "test_value": 1252,
+        "test_percentile_rank": 98.93
+      },
+      "null_scan_pps_floor": {
+        "test_value": 334,
+        "test_percentile_rank": 95.84
+      },
+      "dos_pps_floor": {
+        "test_value": 152,
+        "test_percentile_rank": 91.61
+      },
+      "ddos_fwd_len_mean_floor": {
+        "test_value": 654,
+        "test_percentile_rank": 98.42,
+        "checked_safe_against": [
+          254
+        ]
+      },
+      "ddos_min_fwd_packets": {
+        "test_value": 700,
+        "test_percentile_rank": 99.96,
+        "checked_safe_against": [
+          25
+        ]
+      },
+      "icmp_flood_pps_floor": {
+        "test_value": 20025,
+        "test_percentile_rank": 100.0,
+        "checked_safe_against": [
+          2
+        ],
+        "note": "Sample isolated via a TCP PSH flag to work around a real overlap with check_port_scan/check_null_scan - see the module docstring."
+      },
+      "high_bandwidth_bytes_floor": {
+        "test_value": 14300422,
+        "test_percentile_rank": 100.0,
+        "checked_safe_against": [
+          396
+        ]
+      }
+    },
+    "unvalidated": []
+  },
+  "port_scan_pps_floor": 405.54,
+  "web_attack_pps_floor": 338.93,
+  "null_scan_pps_floor": 189.97,
+  "dos_pps_floor": 96.34,
+  "ddos_fwd_len_mean_floor": 308.5,
+  "icmp_flood_pps_floor": 428.18,
+  "high_bandwidth_bytes_floor": 334236.86,
+  "ddos_min_fwd_packets": 28.0
+}

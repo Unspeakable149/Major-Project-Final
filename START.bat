@@ -14,8 +14,10 @@ REM     - Rui Yang          PCAP Analysis + Threat Map tabs
 REM     - Megan  (v2 ML)    Model Intelligence tab (SHAP / retrain / LSTM)
 REM   Backend is Aalok's week 1-12 live_backend writing the shared
 REM   Aalok\Dashboard\ids_logs.db; the dashboard backfills MITRE tags via
-REM   Aaron's mapping. Aaron's full backend (auto-block + evidence) is
-REM   available via Aalok\Dashboard\start_system.bat option [2].
+REM   Aaron's mapping. Aaron's auto-block (sidebar toggle -> firewall rule)
+REM   is ported into this backend, so it is live here too; his full backend
+REM   adds Severe-incident PCAP evidence capture and is still available via
+REM   Aalok\Dashboard\start_system.bat option [2].
 REM ===================================================
 
 REM ---- self-elevate to Administrator (tshark live capture + netsh need it) ----
@@ -74,7 +76,7 @@ start "IDS Backend" /D "%DASH%" cmd /k python "%BACKEND%"
 
 REM ---- launch the unified SOC dashboard on 8501 (Aalok host + all tabs) ----
 echo [*] Starting unified Streamlit SOC dashboard (port 8501)...
-start "IDS Dashboard" /D "%DASH%" cmd /k python -m streamlit run "%APP%" --server.headless true --server.port 8501
+start "IDS Dashboard" /D "%DASH%" cmd /k python -m streamlit run "%APP%" --server.headless true --server.port 8501 --server.address 127.0.0.1
 echo.
 
 REM ---- wait for the SOC dashboard to bind, then open it ----

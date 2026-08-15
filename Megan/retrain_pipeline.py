@@ -7,15 +7,19 @@ Trigger conditions (all must hold):
   3. (Optional) The model's estimated accuracy has drifted below DRIFT_THRESHOLD.
 
 Versioning:
-  - Every retrain saves rf_model_v<ISO-timestamp>.pkl alongside rf_model.pkl.
-  - The last MAX_VERSIONS are kept; older ones are deleted.
-  - Rollback: python Dashboard/retrain_pipeline.py --rollback
+  - Every RF retrain saves rf_model_v<ISO-timestamp>.pkl alongside rf_model.pkl.
+  - Every LSTM retrain (--lstm) likewise saves lstm_model_v<ISO-timestamp>.pt.
+  - Each keeps its own history of the last MAX_VERSIONS; older ones are deleted.
+  - Rollback RF:   python Dashboard/retrain_pipeline.py --rollback
+  - Rollback LSTM: python Dashboard/retrain_pipeline.py --rollback --lstm
 
 Usage:
   python Dashboard/retrain_pipeline.py            (check + retrain if due)
   python Dashboard/retrain_pipeline.py --force    (retrain regardless of triggers)
+  python Dashboard/retrain_pipeline.py --force --lstm  (also retrain the LSTM)
   python Dashboard/retrain_pipeline.py --status   (print trigger status)
-  python Dashboard/retrain_pipeline.py --rollback (restore previous version)
+  python Dashboard/retrain_pipeline.py --rollback (restore previous RF version)
+  python Dashboard/retrain_pipeline.py --rollback --lstm (restore previous LSTM version)
   python Dashboard/retrain_pipeline.py --rollback --version rf_model_v2024-01-15T12-00-00.pkl
 """
 
@@ -45,6 +49,7 @@ from trainai_rf import assign_behavioral_label as heuristic_label
 _DASH = Path(_fe.__file__).resolve().parent
 MODEL_PATH = _DASH / "rf_model.pkl"
 SCALER_PATH = _DASH / "rf_scaler.pkl"
+LSTM_MODEL_PATH = _DASH / "lstm_model.pt"
 DB_PATH = _DASH / "ids_logs.db"
 STATE_PATH = _DASH / "retrain_state.json"
 VERSIONS_DIR = _DASH / "model_versions"
@@ -72,26 +77,60 @@ def _save_state(state: dict):
 
 # ── Data loading from DB ───────────────────────────────────────────────────────
 
+_DB_COLUMNS = [
+    "id", "src_ip", "threat_level", "severity",
+    "packets_per_sec", "avg_window_size", "syn_ack_ratio", "total_bytes",
+]
+
+
+def _severity_from_label(threat_level) -> int:
+    """live_threat_logs.threat_level is free text like 'Severe (Critical Anomaly)'
+    or 'Moderate (Bandwidth Spike)' — collapse it to the 0/1/2 code trainai_rf's
+    heuristic labels use."""
+    text = str(threat_level)
+    if text.startswith("Severe"):
+        return 2
+    if text.startswith("Moderate"):
+        return 1
+    return 0
+
+
 def _load_alerts_from_db(since_id: int = 0) -> pd.DataFrame:
+    """Pull alerts newer than since_id, including the 4 engineered features
+    live_backend.py actually persists per-alert (packets_per_sec, avg_window_size,
+    syn_ack_ratio, total_bytes), so _synthesise_features_from_alerts doesn't have
+    to fabricate those from scratch.
+
+    NOTE: live_threat_logs has no src_ip/severity columns — the real columns are
+    source_ip/threat_level. This previously queried the wrong names, which meant
+    every call silently returned empty (via the except below) and the retrain
+    trigger never saw real alert volume.
+    """
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             df = pd.read_sql_query(
-                "SELECT id, src_ip, severity FROM live_threat_logs WHERE id > ?",
+                "SELECT id, source_ip AS src_ip, threat_level, "
+                "packets_per_sec, avg_window_size, syn_ack_ratio, total_bytes "
+                "FROM live_threat_logs WHERE id > ?",
                 conn, params=(since_id,),
             )
+        df["severity"] = df["threat_level"].map(_severity_from_label)
     except Exception:
-        df = pd.DataFrame(columns=["id", "src_ip", "severity"])
+        df = pd.DataFrame(columns=_DB_COLUMNS)
     return df
 
 
 def _synthesise_features_from_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
-    """Generate synthetic feature rows from alert records for re-labelling.
+    """Generate feature rows from alert records for re-labelling.
 
-    Since the alerts DB only stores (src_ip, severity) — not raw features —
-    we synthesise plausible feature vectors per severity class using statistical
-    ranges derived from the heuristic rule boundaries. This keeps the retrain
-    loop self-contained without requiring raw PCAP re-parsing.
+    The alerts DB stores 4 of the 18 engineered features directly per alert
+    (packets_per_sec, avg_window_size, syn_ack_ratio, total_bytes) — those are
+    used as-is when present. The other 14 were never persisted raw, so they're
+    still synthesised per severity class using statistical ranges derived from
+    the heuristic rule boundaries. This keeps the retrain loop self-contained
+    without requiring raw PCAP re-parsing.
     """
+    has_real_cols = "packets_per_sec" in alerts.columns
     rng = np.random.default_rng(42)
     rows = []
     for _, alert in alerts.iterrows():
@@ -111,6 +150,19 @@ def _synthesise_features_from_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
         total_packets = int(pps * 2)
         total_bytes = int(total_packets * avg_size)
         duration = 2.0
+        avg_window = rng.uniform(1024, 65535)
+
+        # Prefer the real recorded value over the fabricated estimate wherever
+        # live_backend.py actually persisted one for this alert.
+        if has_real_cols:
+            if pd.notna(alert.get("packets_per_sec")):
+                pps = float(alert["packets_per_sec"])
+            if pd.notna(alert.get("syn_ack_ratio")):
+                syn_ack = float(alert["syn_ack_ratio"])
+            if pd.notna(alert.get("avg_window_size")):
+                avg_window = float(alert["avg_window_size"])
+            if pd.notna(alert.get("total_bytes")):
+                total_bytes = int(alert["total_bytes"])
 
         row = {
             "src_ip": alert["src_ip"],
@@ -131,7 +183,7 @@ def _synthesise_features_from_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
             "unique_target_ips": int(rng.uniform(1, 5)),
             "unique_target_ports": int(pps / 20) if sev == 1 else int(rng.uniform(1, 5)),
             "avg_ttl": rng.uniform(32, 128),
-            "avg_window_size": rng.uniform(1024, 65535),
+            "avg_window_size": avg_window,
             "label": sev,
         }
         rows.append(row)
@@ -262,6 +314,7 @@ def retrain(force: bool = False, retrain_lstm: bool = False) -> bool:
             csv = _DASH / "master_advanced_dataset.csv"
             if csv.exists():
                 print("[INFO] Retraining LSTM …")
+                _version_lstm_model(state)  # version the existing model before overwriting
                 train_lstm(csv)
         except Exception as e:
             print(f"[WARN] LSTM retrain failed: {e}")
@@ -301,6 +354,32 @@ def _version_model(state: dict):
     print(f"  Versioned: {dest.name}")
 
 
+def _version_lstm_model(state: dict):
+    """Copy current lstm_model.pt into model_versions/ with a timestamp suffix.
+
+    Mirrors _version_model() above but for the LSTM — it has its own history
+    list (lstm_version_history) and file prefix since it's a separate model
+    with an independent retrain lifecycle (only retrained when --lstm / the
+    "Also retrain LSTM" checkbox is used).
+    """
+    if not LSTM_MODEL_PATH.exists():
+        return
+
+    VERSIONS_DIR.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    dest = VERSIONS_DIR / f"lstm_model_v{ts}.pt"
+    shutil.copy2(LSTM_MODEL_PATH, dest)
+
+    history: list = state.setdefault("lstm_version_history", [])
+    history.append(str(dest))
+
+    while len(history) > MAX_VERSIONS:
+        old = Path(history.pop(0))
+        old.unlink(missing_ok=True)
+
+    print(f"  Versioned: {dest.name}")
+
+
 # ── Rollback ──────────────────────────────────────────────────────────────────
 
 def rollback(version: str | None = None):
@@ -328,6 +407,24 @@ def rollback(version: str | None = None):
     print(f"[INFO] Rolled back to: {target.name}")
 
 
+def rollback_lstm(version: str | None = None):
+    state = _load_state()
+    history = state.get("lstm_version_history", [])
+
+    if not history:
+        print("[ERROR] No LSTM version history found. Nothing to rollback.")
+        return
+
+    target = Path(version) if version else Path(history[-1])
+
+    if not target.exists():
+        print(f"[ERROR] Version file not found: {target}")
+        return
+
+    shutil.copy2(target, LSTM_MODEL_PATH)
+    print(f"[INFO] Rolled back LSTM to: {target.name}")
+
+
 # ── Streamlit panel ───────────────────────────────────────────────────────────
 
 def render_retrain_panel():
@@ -351,10 +448,20 @@ def render_retrain_panel():
         st.success(f"No retrain needed. Next check: when {MIN_SAMPLES} new alerts accumulate.")
 
     col_a, col_b = st.columns(2)
-    if col_a.button("🔄 Retrain now (force)"):
-        with st.spinner("Retraining …"):
-            retrain(force=True)
-        st.success("Retrain complete. Reload the dashboard.")
+    with col_a:
+        retrain_lstm_too = st.checkbox(
+            "Also retrain LSTM",
+            value=False,
+            help=(
+                "Retrains the LSTM sequence model from master_advanced_dataset.csv "
+                "— it doesn't yet learn from live alerts the way the RF retrain does. "
+                "Takes noticeably longer than the RF alone."
+            ),
+        )
+        if st.button("🔄 Retrain now (force)"):
+            with st.spinner("Retraining … (this can take a while if LSTM is included)"):
+                retrain(force=True, retrain_lstm=retrain_lstm_too)
+            st.success("Retrain complete. Reload the dashboard.")
 
     state2 = _load_state()
     history = state2.get("version_history", [])
@@ -363,7 +470,15 @@ def render_retrain_panel():
         st.success(f"Rolled back to {Path(history[-1]).name}")
 
     if history:
-        st.caption("Saved model versions: " + ", ".join(Path(p).name for p in history))
+        st.caption("Saved RF versions: " + ", ".join(Path(p).name for p in history))
+
+    lstm_history = state2.get("lstm_version_history", [])
+    if lstm_history:
+        st.markdown("---")
+        if st.button("⏪ Rollback LSTM to previous version"):
+            rollback_lstm()
+            st.success(f"Rolled back LSTM to {Path(lstm_history[-1]).name}")
+        st.caption("Saved LSTM versions: " + ", ".join(Path(p).name for p in lstm_history))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -374,11 +489,15 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show trigger status only")
     parser.add_argument("--rollback", action="store_true", help="Rollback to previous model version")
     parser.add_argument("--version", default=None, help="Specific version file to rollback to")
-    parser.add_argument("--lstm", action="store_true", help="Also retrain the LSTM model")
+    parser.add_argument("--lstm", action="store_true",
+                        help="Also retrain the LSTM model, or (with --rollback) target the LSTM's own version history instead of the RF's")
     args = parser.parse_args()
 
     if args.rollback:
-        rollback(args.version)
+        if args.lstm:
+            rollback_lstm(args.version)
+        else:
+            rollback(args.version)
         return
 
     state = _load_state()

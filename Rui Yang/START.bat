@@ -33,7 +33,7 @@ if not exist "%APP%" (
 
 REM ---- launch the upload analyser on 8502 ----
 echo [*] Starting Rui Yang upload analyser (port 8502)...
-start "RY Upload App" cmd /k python -m streamlit run "%APP%" --server.headless true --server.port 8502
+start "RY Upload App" cmd /k python -m streamlit run "%APP%" --server.headless true --server.port 8502 --server.address 127.0.0.1
 
 REM ---- wait for it to bind, then open the browser ----
 echo [*] Waiting for the app to come online...

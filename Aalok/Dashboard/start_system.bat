@@ -88,7 +88,7 @@ if /i "%BACKEND%"=="NONE" (
 
 REM ---- launch dashboard ----
 echo [*] Starting Streamlit SOC dashboard...
-start "IDS Dashboard" cmd /k "cd /d ""%~dp0"" && python -m streamlit run ""%APP%"" --server.headless true --server.port 8501"
+start "IDS Dashboard" cmd /k "cd /d ""%~dp0"" && python -m streamlit run ""%APP%"" --server.headless true --server.port 8501 --server.address 127.0.0.1"
 
 REM ---- wait for Streamlit to bind, then open browser ----
 echo [*] Waiting for dashboard to come online...

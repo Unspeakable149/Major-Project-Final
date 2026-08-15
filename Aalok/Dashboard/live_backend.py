@@ -1,17 +1,23 @@
 """Live IDS backend.
 
 Every WINDOW_SECONDS: tshark capture -> flow aggregation -> RF model +
-heuristic rules -> fusion (max severity) -> SQLite alert log for app.py.
+heuristic rules + LSTM sequence model (capped, see write_alerts) ->
+fusion (max severity) -> SQLite alert log for app.py.
 """
 
 import argparse
+import ipaddress
 import json
 import os
+import queue
+import shutil
 import socket
 import subprocess
 import sqlite3
+import threading
 import time
 import warnings
+from collections import OrderedDict, deque
 from datetime import datetime
 
 import numpy as np
@@ -22,11 +28,144 @@ import notifier
 
 warnings.filterwarnings("ignore")
 
+# ── LSTM sequence model (Layer 5) ─────────────────────────────────────────────
+_LSTM_MODEL = None          # loaded once in load_models(); None if unavailable
+_LSTM_OK = False            # True only if torch + model file both present
+_LSTM_SEQ_LEN = 15          # must match SEQUENCE_LEN the model was trained with
+_LSTM_SEV_MAP = {0: "Baseline (Safe)", 1: "Moderate (Suspicious)", 2: "Severe (Critical Anomaly)"}
+# Per-source-IP rolling buffer of SCALED feature rows (keyed by 'Source IP').
+# Same LRU bound as ROLLING_STATE/INCIDENT_HISTORY below — see _lru_touch().
+_lstm_buffers: "OrderedDict[str, deque]" = OrderedDict()
+
+
+def _load_lstm_safe():
+    """Try to load the LSTM sequence model. Returns (model, ok). Never raises.
+
+    torch and lstm_model.pt both ship inside the packaged .exe, so this succeeds
+    there as well as in a source run. It stays guarded because the layer must be
+    optional: a source checkout without torch installed degrades to the other
+    four behavioural layers rather than failing to start.
+    """
+    try:
+        import sys
+        from pathlib import Path
+        # lstm_model.py lives in the Megan folder. In a source checkout that is
+        # <repo>/Megan (three up from Aalok/Dashboard); in the frozen bundle the
+        # launcher exports HYBRIDIDS_ROOT, matching what app.py resolves.
+        _root = os.environ.get("HYBRIDIDS_ROOT")
+        _lstm_dir = (Path(_root) if _root
+                     else Path(__file__).resolve().parent.parent.parent) / "Megan"
+        if _lstm_dir.exists() and str(_lstm_dir) not in sys.path:
+            sys.path.insert(0, str(_lstm_dir))
+        from lstm_model import load_lstm
+        m = load_lstm()
+        return (m, m is not None)
+    except Exception as e:
+        print(f"[*] LSTM unavailable (sequence layer skipped): {e}")
+        return (None, False)
+
+
+def _load_mitre_safe():
+    """Return Aaron's tag_mitre, or None. Never raises.
+
+    Same folder-resolution trick as _load_lstm_safe: mitre_mapping.py lives in
+    Aaron/, which is <repo>/Aaron in a source checkout and $HYBRIDIDS_ROOT/Aaron
+    in the frozen bundle.
+
+    Why the backend tags at all, when the dashboard also back-fills: back-filling
+    only happens while somebody has the dashboard open. Running the engine
+    headless — START.bat option 2, the CLI, a replay — left every row untagged
+    until a dashboard came along, and the alert emails/webhooks never carried a
+    technique. Tagging at write time makes ATT&CK a property of the alert, and
+    the back-fill stays as the repair path for rows written before this.
+    """
+    try:
+        import sys
+        from pathlib import Path
+        _root = os.environ.get("HYBRIDIDS_ROOT")
+        _mitre_dir = (Path(_root) if _root
+                      else Path(__file__).resolve().parent.parent.parent) / "Aaron"
+        if _mitre_dir.exists() and str(_mitre_dir) not in sys.path:
+            sys.path.insert(0, str(_mitre_dir))
+        from mitre_mapping import tag_mitre as _tag
+        return _tag
+    except Exception as e:
+        print(f"[*] MITRE mapping unavailable (rows tagged by the dashboard instead): {e}")
+        return None
+
+
+_TAG_MITRE = None            # resolved in load_models(); None if Aaron/ is absent
+
+
+def _lstm_predict_scaled(src_ip: str, scaled_row) -> tuple[str | None, bool]:
+    """Append this window's scaled features for src_ip and return
+    (verdict, has_full_history).
+
+    verdict is the LSTM's sequence threat-level string, or None if not enough
+    history or the model is unavailable. has_full_history is True once the
+    buffer holds a full _LSTM_SEQ_LEN windows (~30s) rather than a zero-padded
+    partial sequence — used by the caller to gate how much this verdict is
+    allowed to influence the fused threat level. Fails safe: any error
+    returns (None, False).
+    """
+    if not _LSTM_OK or _LSTM_MODEL is None:
+        return None, False
+    try:
+        import numpy as _np
+        import torch as _torch
+
+        buf = _lru_touch(_lstm_buffers, src_ip, deque(maxlen=_LSTM_SEQ_LEN))
+        buf.append(_np.asarray(scaled_row, dtype=_np.float32))
+
+        if len(buf) < 2:            # need at least 2 windows of history
+            return None, False
+
+        has_full_history = len(buf) >= _LSTM_SEQ_LEN
+        seq = _np.array(buf, dtype=_np.float32)              # (len, 18)
+        if seq.shape[1] != 18:                               # guard: wrong feature count
+            return None, False
+        if len(seq) < _LSTM_SEQ_LEN:                         # left-pad with zeros
+            pad = _np.zeros((_LSTM_SEQ_LEN - len(seq), seq.shape[1]), dtype=_np.float32)
+            seq = _np.vstack([pad, seq])
+
+        with _torch.no_grad():
+            x = _torch.from_numpy(seq).unsqueeze(0)          # (1, 15, 18)
+            sev = int(_LSTM_MODEL(x).argmax(dim=1).item())
+        return _LSTM_SEV_MAP.get(sev), has_full_history
+    except Exception:
+        return None, False         # never break the capture loop
+
 # Suppress console windows when subprocesses launch under a windowed (no-console)
 # frozen build. On non-Windows hosts this constant is 0 and a no-op.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-TSHARK_PATH = r"C:\Program Files\Wireshark\tshark.exe"
+def _resolve_tshark() -> str:
+    """Locate tshark across platforms, preferring whatever is on PATH.
+
+    Was a single hardcoded Windows path, which broke on any non-default
+    Wireshark install and on macOS/Linux entirely. PATH is checked first (the
+    normal case on macOS/Linux and on Windows when Wireshark is on PATH), then
+    the well-known install dirs per OS. Falls back to the bare name so the
+    resulting error still names the command.
+    """
+    from shutil import which
+
+    found = which("tshark")
+    if found:
+        return found
+    candidates = {
+        "nt": [r"C:\Program Files\Wireshark\tshark.exe",
+               r"C:\Program Files (x86)\Wireshark\tshark.exe"],
+    }.get(os.name, [
+        "/usr/bin/tshark", "/usr/local/bin/tshark",       # Linux, Intel macOS
+        "/opt/homebrew/bin/tshark",                        # Apple Silicon Homebrew
+        "/Applications/Wireshark.app/Contents/MacOS/tshark",
+    ])
+    return next((p for p in candidates if os.path.exists(p)),
+                candidates[0] if candidates else "tshark")
+
+
+TSHARK_PATH = _resolve_tshark()
 WINDOW_SECONDS = 2
 DB_FILE = "ids_logs.db"
 INTERFACE_OVERRIDE = None  # set to a tshark interface index (string) to skip auto-detect
@@ -84,13 +223,122 @@ SEVERITY_FLOOR = {
 # Idea 8 — final score -> risk band (upper bound inclusive).
 SCORE_BANDS = [(20, "Normal"), (40, "Low"), (60, "Medium"), (80, "High"), (100, "Critical")]
 
+# Auto-block defaults (overridden at runtime by rows in the autoblock_config
+# table, which the dashboard sidebar writes). Ported from Aaron/live_backend.py
+# so active response works on the unified build too, not only on his own.
+AUTOBLOCK_DEFAULT_THRESHOLD   = 3     # Severe alerts before auto-blocking an IP
+AUTOBLOCK_DEFAULT_TTL_SECONDS = 3600  # Block duration (1 hour)
+
+# netsh is Windows-only. On macOS/Linux the block is still recorded in
+# blocked_ips (so the dashboard's list stays accurate) but the rule is not
+# pushed, and the reason string says so rather than implying enforcement.
+FIREWALL_SUPPORTED = os.name == "nt"
+
+# Alert deduplication: suppress re-alerting the same (src_ip, severity) within
+# this many seconds. 30 s keeps the DB and the dashboard table readable while
+# still logging a fresh row whenever an attacker is *still* active afterwards.
+# Ported from Aaron/live_backend.py.
+DEDUP_WINDOW_SECONDS = 30
+
+# Directory for Severe-incident PCAP evidence, created at startup. Also from
+# Aaron's backend: the dashboard has always had the UI to list and download
+# these (evidence_path column, per-row links, zip export), but only his engine
+# ever wrote them, so on the unified build that whole panel sat permanently empty.
+EVIDENCE_DIR = "evidence"
+
+# The scratch file each capture window writes to and the next one overwrites.
+# Named once because evidence capture has to copy this exact file out of the way
+# between windows — a second literal here would be a silent way to break that.
+CAPTURE_FILE = "temp_live.pcap"
+
 # Per-source-IP rolling history across capture windows. Enables slow-rate /
 # brute-force detection that a single 2s window can't see on its own.
-ROLLING_STATE: dict[str, list[dict]] = {}
+#
+# Bounded: the per-IP list is capped at ROLLING_WINDOWS, but the number of *keys*
+# is capped too. A backend watching a public NIC meets a practically unlimited
+# number of source IPs, and an entry that is never evicted is a slow leak across
+# a long run. OrderedDict + move_to_end gives LRU eviction: the
+# MAX_TRACKED_IPS most-recently-seen sources are kept, which is far more history
+# than the 15-window (~30 s) rules can ever consult, so detection is unchanged.
+MAX_TRACKED_IPS = 4096
+
+ROLLING_STATE: "OrderedDict[str, list[dict]]" = OrderedDict()
 
 # Idea 6 — per-source incident memory for this backend session. Repeat offenders
 # accrue a historical score. Reset on restart; the SQLite log is the durable copy.
-INCIDENT_HISTORY: dict[str, int] = {}
+# Same LRU bound as ROLLING_STATE.
+INCIDENT_HISTORY: "OrderedDict[str, int]" = OrderedDict()
+
+# Dedup state: _LAST_ALERT_TS[src_ip][threat_level] = unix timestamp of the last
+# row written for that pair. Aaron's version is a defaultdict, which never evicts;
+# on a public NIC that is one dict entry per source IP ever seen, so it uses the
+# same LRU bound as the other per-IP stores here.
+_LAST_ALERT_TS: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+
+# Severe hits per source for this backend session. Auto-block used to derive its
+# count purely from rows in live_threat_logs, which was fine until dedup started
+# suppressing those rows: a sustained flood then logs one Severe row per
+# DEDUP_WINDOW_SECONDS, so a threshold of 3 would take ~90s to trip instead of
+# ~6s. Enforcement should follow what the sensor saw, not what the log kept.
+SEVERE_HITS: "OrderedDict[str, int]" = OrderedDict()
+
+
+# ── Severe-alert dispatch ─────────────────────────────────────────────────────
+# notifier.notify_severe() does blocking network I/O: SMTP (10 s timeout) plus
+# Discord/Slack webhooks (10 s each). Called inline from the capture loop, one
+# unreachable mail server stalls a 2-second window for up to 30 s — and packets
+# that arrive during the stall are never captured, so a notification outage
+# silently became a *detection* outage.
+#
+# A single daemon worker draining a bounded queue decouples the two: the capture
+# loop only pays an enqueue. One consumer keeps alert ordering and the notifier's
+# per-(IP, channel) throttle race-free, and the maxsize bound means a wedged
+# endpoint drops alerts rather than growing the queue without limit.
+_NOTIFY_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=256)
+_NOTIFY_THREAD: threading.Thread | None = None
+
+
+def _notify_worker() -> None:
+    """Drain queued Severe alerts, one at a time, off the capture thread."""
+    while True:
+        alert = _NOTIFY_QUEUE.get()
+        try:
+            notifier.notify_severe(alert)
+        except Exception as exc:  # never let a notifier fault kill the worker
+            print(f"[!] notifier dispatch failed: {exc}")
+        finally:
+            _NOTIFY_QUEUE.task_done()
+
+
+def queue_severe_alert(alert: dict) -> None:
+    """Hand a Severe alert to the background notifier. Never blocks."""
+    global _NOTIFY_THREAD
+    if _NOTIFY_THREAD is None:
+        _NOTIFY_THREAD = threading.Thread(
+            target=_notify_worker, name="notifier-dispatch", daemon=True
+        )
+        _NOTIFY_THREAD.start()
+    try:
+        _NOTIFY_QUEUE.put_nowait(alert)
+    except queue.Full:
+        # Sustained flood + slow endpoint. Dropping the notification is correct:
+        # the alert is already durable in SQLite and on the dashboard.
+        print("[!] notifier backlog full — alert not pushed (capture unaffected)")
+
+
+def _lru_touch(store: OrderedDict, key: str, default):
+    """Fetch-or-create ``key`` in ``store``, marking it most-recently-used.
+
+    Evicts the least-recently-seen entries once the store exceeds
+    MAX_TRACKED_IPS so a long-running capture cannot grow without bound.
+    """
+    if key in store:
+        store.move_to_end(key)
+    else:
+        store[key] = default
+        while len(store) > MAX_TRACKED_IPS:
+            store.popitem(last=False)
+    return store[key]
 
 FEATURE_COLS = [
     'total_packets', 'total_bytes', 'unique_target_ips', 'unique_target_ports',
@@ -199,14 +447,18 @@ def get_active_interface() -> str:
 
 
 def classify_profile(pps: float, sar: float, ports: int, avg_size: float):
+    # Aggressive port scan: many distinct ports AND high packet rate
+    # (catches fast nmap before the DDoS rule mislabels it — see TEST_RESULTS.md §5).
+    if ports > 20 and pps > 500:
+        return "Aggressive Port Scan", "Severe (Critical Anomaly)"
+    if ports > 20:
+        return "Port Scan / Reconnaissance", "Moderate (Suspicious)"
     if pps > 500 and sar > 5:
         return "DDoS SYN Flood", "Severe (Critical Anomaly)"
     if pps > 1000:
         return "High-Volume Flood Attack", "Severe (Critical Anomaly)"
     if pps > 300 and avg_size > 800:
         return "Speed Test / Large Data Transfer", "Moderate (Bandwidth Spike)"
-    if ports > 20:
-        return "Port Scan / Reconnaissance", "Moderate (Suspicious)"
     if pps <= 5 and avg_size < 150:
         return "Ping / Background Telemetry", "Baseline (Safe)"
     return "Standard Web Traffic", "Baseline (Safe)"
@@ -417,7 +669,7 @@ def load_baseline(quiet: bool = False) -> set[str]:
 
 def update_rolling(src_ip: str, total_packets: int, unique_ports: int, syn_flags: int) -> dict:
     """Maintain bounded per-IP history; return aggregated stats across history."""
-    history = ROLLING_STATE.setdefault(src_ip, [])
+    history = _lru_touch(ROLLING_STATE, src_ip, [])
     history.append({"packets": total_packets, "ports": unique_ports, "syn": syn_flags})
     if len(history) > ROLLING_WINDOWS:
         del history[:-ROLLING_WINDOWS]
@@ -445,10 +697,17 @@ def slow_attack_check(rolling: dict) -> tuple[str, str] | None:
 
 def load_models():
     """Prefer RF; fall back to K-Means if RF artifacts missing."""
+    global _LSTM_MODEL, _LSTM_OK, _TAG_MITRE
+    _TAG_MITRE = _load_mitre_safe()
+    if _TAG_MITRE:
+        print("[+] MITRE ATT&CK mapping loaded.")
     try:
         model = joblib.load("rf_model.pkl")
         scaler = joblib.load("rf_scaler.pkl")
         print("[+] Random Forest model loaded.")
+        _LSTM_MODEL, _LSTM_OK = _load_lstm_safe()
+        if _LSTM_OK:
+            print("[+] LSTM sequence model loaded.")
         return model, scaler, True
     except FileNotFoundError:
         model = joblib.load("advanced_kmeans_model.pkl")
@@ -488,16 +747,19 @@ def init_db():
         'ALTER TABLE live_threat_logs ADD COLUMN dest_ports TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN top_source_port INTEGER',
         'ALTER TABLE live_threat_logs ADD COLUMN source_ports TEXT',
-        # Per-layer detection signals (the four verdicts fuse() collapses into
-        # threat_level, plus the intel/baseline overrides). Stored so the
-        # dashboard can explain *why* a flow got its severity instead of only
-        # showing the fused result.
+        # Per-layer detection signals (the five verdicts fuse() collapses into
+        # threat_level — rf/heuristic/slow/dns/lstm — plus the intel/baseline
+        # overrides). sig_lstm stores the LSTM's raw (uncapped) verdict even
+        # though its actual contribution to threat_level is capped — see
+        # write_alerts(). Stored so the dashboard can explain *why* a flow got
+        # its severity instead of only showing the fused result.
         'ALTER TABLE live_threat_logs ADD COLUMN sig_heuristic TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN sig_rf TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN sig_slow TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN sig_dns TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN sig_intel INTEGER DEFAULT 0',
         'ALTER TABLE live_threat_logs ADD COLUMN sig_baseline INTEGER DEFAULT 0',
+        'ALTER TABLE live_threat_logs ADD COLUMN sig_lstm TEXT',
         # Threat Scoring enhancement: the 0-100 numeric score, its risk band, and
         # the analyst-report text (reasons/actions) + component breakdown JSON.
         'ALTER TABLE live_threat_logs ADD COLUMN threat_score INTEGER',
@@ -505,6 +767,21 @@ def init_db():
         'ALTER TABLE live_threat_logs ADD COLUMN threat_reasons TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN threat_actions TEXT',
         'ALTER TABLE live_threat_logs ADD COLUMN threat_breakdown TEXT',
+        # MITRE ATT&CK tagging columns. The dashboard back-fills these from the
+        # traffic profile via Aaron's mapping, but it only does so when the
+        # columns exist (`has_mitre`), and only Aaron's backend used to create
+        # them. START.bat runs *this* backend, so on a fresh database the whole
+        # ATT&CK feature silently disappeared — no error, just an absent column.
+        # Both backends write one shared schema, so declare them here too.
+        'ALTER TABLE live_threat_logs ADD COLUMN mitre_technique_id TEXT DEFAULT NULL',
+        'ALTER TABLE live_threat_logs ADD COLUMN mitre_sub_technique_id TEXT DEFAULT NULL',
+        'ALTER TABLE live_threat_logs ADD COLUMN mitre_technique_name TEXT DEFAULT NULL',
+        'ALTER TABLE live_threat_logs ADD COLUMN mitre_tactic TEXT DEFAULT NULL',
+        'ALTER TABLE live_threat_logs ADD COLUMN mitre_tactic_id TEXT DEFAULT NULL',
+        # Path to the PCAP saved for a Severe incident. load_threat_logs() already
+        # looks for this column and the dashboard already renders download links
+        # from it — the column just never existed on a database this backend made.
+        'ALTER TABLE live_threat_logs ADD COLUMN evidence_path TEXT DEFAULT NULL',
     ):
         try:
             cur.execute(ddl)
@@ -529,11 +806,73 @@ def init_db():
             value TEXT NOT NULL
         )
     ''')
-    cur.execute(
-        "INSERT OR IGNORE INTO capture_config (key, value) VALUES ('bpf_filter', '')"
+    cur.executemany(
+        "INSERT OR IGNORE INTO capture_config (key, value) VALUES (?, ?)",
+        # 'interface' pins the tshark interface index the capture loop listens
+        # on. Empty means auto-detect (the default-route adapter). It lives here
+        # rather than in a CLI flag because the desktop .exe never passes argv to
+        # the engine, which left a wrong auto-detect with no way to correct it.
+        [("bpf_filter", ""), ("interface", "")],
     )
+    # ── Active response (Aaron): blocked_ips + autoblock_config ─────────────
+    # app.py creates these too (the dashboard can open before the backend has
+    # ever run); both sides are idempotent so whichever starts first wins.
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_ips (
+            ip          TEXT PRIMARY KEY,
+            blocked_at  REAL    NOT NULL,
+            ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+            reason      TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS autoblock_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+    cur.executemany(
+        "INSERT OR IGNORE INTO autoblock_config (key, value) VALUES (?, ?)",
+        [
+            ("enabled",     "0"),
+            ("threshold",   str(AUTOBLOCK_DEFAULT_THRESHOLD)),
+            ("ttl_seconds", str(AUTOBLOCK_DEFAULT_TTL_SECONDS)),
+        ],
+    )
+    # Covering indexes for the dashboard's hot read paths. Without these every
+    # per-IP protocol lookup and the MITRE backfill probe full-scan tables that
+    # grow by ~1300 rows/minute of capture, so refresh cost climbed with uptime.
+    for ddl in (
+        # protocol_breakdown: "WHERE source_ip = ? GROUP BY protocol" panels.
+        'CREATE INDEX IF NOT EXISTS idx_proto_src ON protocol_breakdown (source_ip, protocol)',
+        # protocol_breakdown: "WHERE protocol = 'DNS' GROUP BY source_ip".
+        'CREATE INDEX IF NOT EXISTS idx_proto_proto ON protocol_breakdown (protocol)',
+        # live_threat_logs: per-source drill-downs and Top Talkers.
+        'CREATE INDEX IF NOT EXISTS idx_logs_src ON live_threat_logs (source_ip)',
+    ):
+        try:
+            cur.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # index already exists / column absent on a legacy DB
+    # Partial index: the MITRE backfill only ever probes for untagged rows, so
+    # index just those. Stays tiny once the backlog is drained.
+    try:
+        cur.execute(
+            'CREATE INDEX IF NOT EXISTS idx_logs_mitre_untagged '
+            'ON live_threat_logs (id) WHERE mitre_technique_id IS NULL'
+        )
+    except sqlite3.OperationalError:
+        pass  # pre-MITRE schema — column not migrated in yet
     conn.commit()
     conn.close()
+
+    # Evidence lands here as soon as the first Severe alert fires, so create it
+    # up front rather than on the hot path. Failure is not fatal: _capture_evidence
+    # degrades to logging no evidence rather than taking the capture loop down.
+    try:
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    except OSError as exc:
+        print(f"[!] could not create evidence directory {EVIDENCE_DIR}: {exc}")
 
 
 def read_capture_filter() -> str:
@@ -549,6 +888,63 @@ def read_capture_filter() -> str:
         return ""
 
 
+def read_capture_interface() -> str:
+    """Return the tshark interface index pinned in the dashboard ('' = auto).
+
+    get_active_interface() picks whichever adapter carries the default route,
+    which is right for internet traffic and wrong for everything else: an attack
+    replayed from a VM lands on a VMnet adapter, a localhost test lands on the
+    Npcap loopback adapter, and a VPN moves the default route off the NIC the
+    traffic is actually on. In every one of those cases the engine captures a
+    quiet interface and reports "no packets in window" while the attack runs.
+    Pinning the index here makes that correctable at runtime, in the UI.
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        row = conn.execute(
+            "SELECT value FROM capture_config WHERE key='interface'"
+        ).fetchone()
+        conn.close()
+        return (row[0] if row else "").strip()
+    except sqlite3.OperationalError:
+        return ""
+
+
+def list_capture_interfaces() -> list[tuple[str, str]]:
+    """Return [(tshark index, friendly name)] from ``tshark -D``.
+
+    Feeds the dashboard's interface picker. tshark prints lines shaped like
+    ``5. \\Device\\NPF_{GUID} (WiFi)``; the trailing parenthesised name is what a
+    human recognises, so prefer it and fall back to the raw device path when a
+    line has no friendly name. Returns [] when tshark is missing or fails, and
+    the caller degrades to "auto-detect only".
+
+    Split on the FIRST '(' rather than the last: the ETW reader's name itself
+    contains parentheses ("Event Tracing for Windows (ETW) reader"), and
+    matching from the right truncates it to "ETW) reader".
+    """
+    try:
+        output = subprocess.check_output(
+            [TSHARK_PATH, "-D"], text=True, stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return []
+
+    interfaces = []
+    for line in output.splitlines():
+        line = line.strip()
+        idx, sep, rest = line.partition(".")
+        if not sep or not idx.strip().isdigit():
+            continue
+        rest = rest.strip()
+        name = rest
+        if rest.endswith(")") and "(" in rest:
+            name = rest[rest.index("(") + 1:-1].strip() or rest
+        interfaces.append((idx.strip(), name))
+    return interfaces
+
+
 def capture_window(interface: str, bpf_filter: str = "") -> pd.DataFrame:
     """Run a single tshark capture + extraction cycle.
 
@@ -557,7 +953,7 @@ def capture_window(interface: str, bpf_filter: str = "") -> pd.DataFrame:
     makes tshark capture nothing -> the caller's empty-window guard handles it.
     """
     capture_cmd = [TSHARK_PATH, "-i", interface,
-                   "-a", f"duration:{WINDOW_SECONDS}", "-w", "temp_live.pcap"]
+                   "-a", f"duration:{WINDOW_SECONDS}", "-w", CAPTURE_FILE]
     if bpf_filter:
         capture_cmd += ["-f", bpf_filter]
     subprocess.run(
@@ -566,7 +962,7 @@ def capture_window(interface: str, bpf_filter: str = "") -> pd.DataFrame:
         creationflags=NO_WINDOW,
     )
 
-    extract_cmd = [TSHARK_PATH, "-r", "temp_live.pcap", "-T", "fields"]
+    extract_cmd = [TSHARK_PATH, "-r", CAPTURE_FILE, "-T", "fields"]
     for field in TSHARK_FIELDS:
         extract_cmd += ["-e", field]
     extract_cmd += ["-E", "header=y", "-E", "separator=,", "-E", "quote=d"]
@@ -759,6 +1155,234 @@ def fuse(*threats: str) -> str:
     return max(threats, key=lambda t: SEVERITY_RANK.get(t, 0))
 
 
+# ── Auto-block helpers (ported from Aaron/live_backend.py) ────────────────────
+# The dashboard sidebar writes autoblock_config and renders blocked_ips, but the
+# enforcement half only ever lived in Aaron's backend, so on the unified build
+# the toggle saved settings nothing read. These four functions close that gap:
+# write_alerts() expires stale blocks once per window, then auto-blocks any
+# source IP whose lifetime Severe count reaches the configured threshold.
+
+def _is_valid_ip(ip_address) -> bool:
+    """True only for a well-formed IP literal.
+
+    Guards the netsh calls. They already pass arguments as a list (no shell),
+    so this is not closing an injection hole — it stops a malformed value read
+    out of a capture window from reaching a firewall-modifying command at all.
+    """
+    try:
+        ipaddress.ip_address(str(ip_address).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _read_autoblock_config(conn: sqlite3.Connection) -> dict:
+    """Read auto-block settings from the DB config table.
+
+    Returns a dict with keys: enabled (bool), threshold (int), ttl_seconds (int).
+    Falls back to module-level defaults if rows are missing.
+    """
+    try:
+        rows = conn.execute("SELECT key, value FROM autoblock_config").fetchall()
+    except sqlite3.OperationalError:
+        rows = []          # legacy DB predating the table; treat as disabled
+    raw = dict(rows)
+    try:
+        return {
+            "enabled":     bool(int(raw.get("enabled", "0"))),
+            "threshold":   int(raw.get("threshold",   str(AUTOBLOCK_DEFAULT_THRESHOLD))),
+            "ttl_seconds": int(raw.get("ttl_seconds", str(AUTOBLOCK_DEFAULT_TTL_SECONDS))),
+        }
+    except (TypeError, ValueError):
+        # A hand-edited / corrupt config row must not take the capture loop down.
+        return {"enabled": False,
+                "threshold": AUTOBLOCK_DEFAULT_THRESHOLD,
+                "ttl_seconds": AUTOBLOCK_DEFAULT_TTL_SECONDS}
+
+
+def _maybe_auto_block(conn: sqlite3.Connection, cur, src_ip: str,
+                      threat: str, cfg: dict, session_hits: int = 0) -> None:
+    """Insert a blocked_ips row and push a firewall rule when the Severe-hit
+    threshold is reached.
+
+    Called inside write_alerts() for each Severe flow. Skips quietly when
+    auto-block is disabled, when the IP is already blocked, or when the hit count
+    is below threshold.
+
+    The count is the larger of what this session has seen (`session_hits`) and
+    what is on record in live_threat_logs. The session figure keeps alert dedup
+    from delaying enforcement; the DB figure keeps history from a previous run
+    counting, so restarting the backend does not reset an attacker's tally.
+    """
+    if not cfg["enabled"]:
+        return
+    if threat != "Severe (Critical Anomaly)":
+        return
+    if not _is_valid_ip(src_ip):
+        return
+
+    already = conn.execute(
+        "SELECT 1 FROM blocked_ips WHERE ip = ?", (src_ip,)
+    ).fetchone()
+    if already:
+        return
+
+    count = max(session_hits, conn.execute(
+        "SELECT COUNT(*) FROM live_threat_logs "
+        "WHERE source_ip = ? AND threat_level = 'Severe (Critical Anomaly)'",
+        (src_ip,),
+    ).fetchone()[0])
+
+    if count < cfg["threshold"]:
+        return
+
+    reason = f"Auto-blocked: {count} Severe alert(s) >= threshold {cfg['threshold']}"
+    if not FIREWALL_SUPPORTED:
+        reason += " (recorded only - netsh unavailable on this OS)"
+    cur.execute(
+        "INSERT OR REPLACE INTO blocked_ips (ip, blocked_at, ttl_seconds, reason) "
+        "VALUES (?, ?, ?, ?)",
+        (src_ip, time.time(), cfg["ttl_seconds"], reason),
+    )
+    print(f"  [AUTO-BLOCK] {src_ip} - {reason}")
+    _apply_firewall_block(src_ip)
+
+
+def _expire_blocks(conn: sqlite3.Connection, cur) -> None:
+    """Delete rows from blocked_ips whose TTL has elapsed and remove the
+    corresponding firewall rules.
+
+    Called once per capture window so expiry is effectively cron-style without
+    a separate scheduler thread. Covers manual dashboard blocks too — they are
+    written to the same table with the same TTL.
+    """
+    now = time.time()
+    try:
+        expired = conn.execute(
+            "SELECT ip FROM blocked_ips WHERE (? - blocked_at) >= ttl_seconds",
+            (now,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return             # legacy DB predating the table
+    for (ip,) in expired:
+        cur.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
+        print(f"  [AUTO-BLOCK] block expired, removing rule for {ip}")
+        _remove_firewall_block(ip)
+
+
+def _apply_firewall_block(ip: str) -> None:
+    if not FIREWALL_SUPPORTED or not _is_valid_ip(ip):
+        return
+    rule_name = f"IDS_BLOCK_{ip.replace('.', '_').replace(':', '_')}"
+    try:
+        result = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=block", f"remoteip={ip}"],
+            capture_output=True, text=True, creationflags=NO_WINDOW,
+        )
+    except OSError as exc:
+        print(f"  [AUTO-BLOCK] netsh unavailable ({exc}); {ip} recorded only")
+        return
+    if result.returncode != 0:
+        print(f"  [AUTO-BLOCK] netsh block failed for {ip}: {result.stderr.strip()}")
+
+
+def _remove_firewall_block(ip: str) -> None:
+    if not FIREWALL_SUPPORTED or not _is_valid_ip(ip):
+        return
+    rule_name = f"IDS_BLOCK_{ip.replace('.', '_').replace(':', '_')}"
+    try:
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, creationflags=NO_WINDOW,
+        )
+    except OSError as exc:
+        print(f"  [AUTO-BLOCK] netsh unavailable ({exc}); rule for {ip} left as-is")
+
+
+# ── Alert dedup + evidence capture (ported from Aaron/live_backend.py) ────────
+# The other half of his active-response work. Both were reachable only from his
+# own backend, so START.bat and the .exe — which run this engine — logged a fresh
+# row for every window an attack persisted, and never saved a single PCAP even
+# though the dashboard has had the evidence UI all along.
+
+def _is_suppressed(src_ip: str, threat_level: str) -> bool:
+    """True when an identical (src_ip, threat_level) alert was written within
+    DEDUP_WINDOW_SECONDS.
+
+    Side effect: when the alert is *not* suppressed the timestamp is refreshed,
+    so the window restarts from the row that actually got written.
+    """
+    now = time.time()
+    seen = _lru_touch(_LAST_ALERT_TS, src_ip, {})
+    if now - seen.get(threat_level, 0.0) < DEDUP_WINDOW_SECONDS:
+        return True
+    seen[threat_level] = now
+    return False
+
+
+def _capture_evidence(src_ip: str) -> str | None:
+    """Copy the window's capture out of the way before the next one overwrites it.
+
+    Returns the saved path, or None when there is nothing to copy (first-window
+    race, or replay mode where no live capture file exists). Never raises: losing
+    a piece of evidence must not stop the alert it belongs to from being written.
+
+    Filename: evidence/YYYYMMDD_HHMMSS_<ip>.pcap, with the IP's separators turned
+    into underscores so it is a legal filename on Windows and POSIX alike.
+    """
+    if not os.path.exists(CAPTURE_FILE):
+        return None
+    safe_ip = src_ip.replace(".", "_").replace(":", "_")
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(EVIDENCE_DIR, f"{ts_str}_{safe_ip}.pcap")
+    try:
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        shutil.copy2(CAPTURE_FILE, dest)
+        return dest
+    except OSError as exc:
+        print(f"[!] evidence capture failed for {src_ip}: {exc}")
+        return None
+
+
+def apply_lstm_cap(
+    base_threats: list[str], lstm_threat: str | None, lstm_full_history: bool
+) -> tuple[list[str], str | None]:
+    """Fold the LSTM's verdict into the list of signals fuse() will consider,
+    capping how much a single, possibly-partial-history LSTM read can escalate
+    on its own.
+
+    - None (no verdict yet / model unavailable): no contribution.
+    - Baseline/Moderate: added as-is — the LSTM can push Baseline -> Moderate
+      alone (the slow-scan case it exists to catch).
+    - Severe: only added as Severe if the buffer has a full sequence AND
+      another signal already independently reached Moderate+; otherwise it's
+      downgraded to Moderate. This stops 4 seconds of LSTM history (or a
+      lone, unconfirmed LSTM read) from unilaterally triggering the highest
+      severity band — there's no drift/accuracy monitoring on this model the
+      way there is for the RF.
+
+    Returns (updated_threats_list, effective_lstm_threat) where the latter is
+    what was actually folded in (for profile/attribution purposes), or None
+    if nothing was added.
+    """
+    threats = list(base_threats)
+    if lstm_threat is None:
+        return threats, None
+
+    if lstm_threat == "Severe (Critical Anomaly)":
+        other_max_rank = max(SEVERITY_RANK.get(t, 0) for t in threats)
+        if lstm_full_history and other_max_rank >= SEVERITY_RANK["Moderate (Suspicious)"]:
+            effective = lstm_threat
+        else:
+            effective = "Moderate (Suspicious)"
+    else:
+        effective = lstm_threat
+
+    threats.append(effective)
+    return threats, effective
+
+
 def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: set,
                  baseline_ips: set | None = None, quiet: bool = False,
                  per_proto_df: pd.DataFrame | None = None) -> dict:
@@ -813,8 +1437,21 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
     conn = sqlite3.connect(DB_FILE, timeout=10)
     cur = conn.cursor()
 
+    # ── Auto-block: expire stale blocks first, then read the current config ──
+    # Config is re-read every window (not cached) so a sidebar toggle takes
+    # effect on the next capture cycle without restarting the backend.
+    _expire_blocks(conn, cur)
+    conn.commit()
+    autoblock_cfg = _read_autoblock_config(conn)
+
     for i, (_, row) in enumerate(flows.reset_index(drop=True).iterrows()):
         src_ip = row['Source IP']
+        # LSTM sequence verdict (same scaled features the RF sees). Always
+        # recorded raw in sig_lstm; its influence on the fused `threat` is
+        # capped below (see apply_lstm_cap) rather than trusted outright,
+        # since it votes off as little as 2 windows (4s) of history and has
+        # no drift/accuracy monitoring the way the RF does.
+        lstm_threat, lstm_full_history = _lstm_predict_scaled(src_ip, scaled_all[i])
         pps = row['packets_per_second']
         sar = row['syn_ack_ratio']
         ports = row['unique_target_ports']
@@ -849,7 +1486,12 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
         # Layer 4: threat intel feed (overrides everything else)
         intel_hit = src_ip in intel_ips
 
-        threat = fuse(rf_threat, heuristic_threat, slow_threat, dns_threat)
+        # Layer 5: LSTM sequence verdict, capped — see apply_lstm_cap().
+        fuse_inputs, effective_lstm_threat = apply_lstm_cap(
+            [rf_threat, heuristic_threat, slow_threat, dns_threat],
+            lstm_threat, lstm_full_history,
+        )
+        threat = fuse(*fuse_inputs)
         if intel_hit:
             threat = "Severe (Critical Anomaly)"
             profile = "Known Malicious IP (Threat Intel Match)"
@@ -862,6 +1504,9 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
             profile = dns_profile
         elif slow_hit and SEVERITY_RANK.get(slow_threat, 0) >= SEVERITY_RANK.get(threat, 0):
             profile = slow_profile
+        elif (effective_lstm_threat and effective_lstm_threat != "Baseline (Safe)"
+              and SEVERITY_RANK.get(effective_lstm_threat, 0) >= SEVERITY_RANK.get(threat, 0)):
+            profile = "LSTM Sequence Anomaly (multi-window)"
 
         # Threat Scoring enhancement: fold the fused verdict + several factors
         # into a 0-100 score, a risk band, and an analyst report. prior_incidents
@@ -875,18 +1520,66 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
             prior_incidents, intel_hit, base_hit,
         )
         if threat != "Baseline (Safe)" and not base_hit:
+            _lru_touch(INCIDENT_HISTORY, src_ip, 0)
             INCIDENT_HISTORY[src_ip] = prior_incidents + 1
 
+        # ── Alert deduplication (Aaron) ──────────────────────────────────────
+        # Counted first, then skipped: an attack that persists across windows is
+        # real activity the caller's totals should reflect, it just does not need
+        # a near-identical row every 2 seconds. Incident history above is updated
+        # for the same reason. Scoring has already run, so a suppressed flow costs
+        # only the work that was going to happen anyway.
+        counts[threat] = counts.get(threat, 0) + 1
+
+        # Active response runs off the flow, not the logged row, so a suppressed
+        # duplicate still counts toward the threshold. Before the insert is fine:
+        # _maybe_auto_block takes this tally as a floor over the DB count.
+        if threat == "Severe (Critical Anomaly)":
+            _lru_touch(SEVERE_HITS, src_ip, 0)
+            SEVERE_HITS[src_ip] = SEVERE_HITS.get(src_ip, 0) + 1
+            _maybe_auto_block(conn, cur, src_ip, threat, autoblock_cfg,
+                              SEVERE_HITS[src_ip])
+
+        if _is_suppressed(src_ip, threat):
+            if not quiet:
+                conf_str = f"{confidence*100:5.1f}%" if use_rf else "  n/a"
+                intel_tag = "  [INTEL]" if intel_hit else ""
+                print(f"  [{src_ip:>15}]  {profile:<40}  {threat:<30}  "
+                      f"score={score_info['score']:3d}/100 {score_info['band']:<9} "
+                      f"conf={conf_str}  pps={pps:6.0f}  sar={sar:4.1f}  syn={syn_count}"
+                      f"  [SUPPRESSED]{intel_tag}")
+            continue  # no DB row, no notifier, no auto-block for this window
+
+        # ── PCAP evidence capture, Severe only (Aaron) ───────────────────────
+        # Has to happen before the next window overwrites the capture file.
+        evidence_path: str | None = None
+        if threat == "Severe (Critical Anomaly)":
+            evidence_path = _capture_evidence(src_ip)
+            if evidence_path and not quiet:
+                print(f"  [EVIDENCE] saved -> {evidence_path}")
+
         ts = datetime.now().strftime("%H:%M:%S")
+
+        # ── MITRE ATT&CK tagging at write time (Aaron) ───────────────────────
+        # NULLs when Aaron/ is not resolvable; the dashboard's _backfill_mitre()
+        # then fills them in exactly as before, so this is additive.
+        if _TAG_MITRE:
+            m_tid, m_sub, m_name, m_tactic, m_tactic_id = _TAG_MITRE(profile)
+        else:
+            m_tid = m_sub = m_name = m_tactic = m_tactic_id = None
+
         cur.execute('''
             INSERT INTO live_threat_logs
             (timestamp, source_ip, packets_per_sec, avg_window_size, syn_ack_ratio,
-             total_bytes, traffic_profile, threat_level, confidence,
+             total_bytes, traffic_profile, threat_level, confidence, evidence_path,
+             mitre_technique_id, mitre_sub_technique_id, mitre_technique_name,
+             mitre_tactic, mitre_tactic_id,
              top_dest_port, dominant_transport, dest_ports,
              top_source_port, source_ports,
-             sig_heuristic, sig_rf, sig_slow, sig_dns, sig_intel, sig_baseline,
+             sig_heuristic, sig_rf, sig_slow, sig_dns, sig_lstm, sig_intel, sig_baseline,
              threat_score, score_band, threat_reasons, threat_actions, threat_breakdown)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             ts,
             src_ip,
@@ -897,6 +1590,8 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
             profile,
             threat,
             round(confidence, 4),
+            evidence_path,
+            m_tid, m_sub, m_name, m_tactic, m_tactic_id,
             int(row.get('top_dest_port', 0) or 0),
             str(row.get('dominant_transport', '') or ''),
             str(row.get('dest_ports', '') or ''),
@@ -907,6 +1602,7 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
             rf_threat,
             slow_threat,
             dns_threat,
+            lstm_threat,
             int(intel_hit),
             int(base_hit),
             # Threat score + report (reasons/actions joined; breakdown as JSON).
@@ -918,7 +1614,7 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
         ))
 
         if threat == "Severe (Critical Anomaly)":
-            notifier.notify_severe({
+            queue_severe_alert({
                 "timestamp": ts,
                 "source_ip": src_ip,
                 "profile": profile,
@@ -930,8 +1626,9 @@ def write_alerts(flows: pd.DataFrame, model, scaler, use_rf: bool, intel_ips: se
                 "threat_score": int(score_info["score"]),
                 "score_band": score_info["band"],
             })
-
-        counts[threat] = counts.get(threat, 0) + 1
+        # counts was already incremented above, before the dedup check, so that
+        # suppressed windows still show up in the caller's per-window totals.
+        # Auto-block also ran there, for the same reason.
 
         if not quiet:
             conf_str = f"{confidence*100:5.1f}%" if use_rf else "  n/a"
@@ -1090,12 +1787,29 @@ def main():
                     baseline_ips=baseline_ips, realtime=args.realtime)
         return
 
-    interface = args.interface or INTERFACE_OVERRIDE or get_active_interface()
+    # --interface wins outright; otherwise the dashboard's pinned index wins over
+    # auto-detect. Only the last case is re-evaluated below, so an explicit CLI
+    # choice is never silently overridden by whatever the UI happens to hold.
+    cli_interface = args.interface or INTERFACE_OVERRIDE
+    pinned_interface = "" if cli_interface else read_capture_interface()
+    interface = cli_interface or pinned_interface or get_active_interface()
     print(f"\n[+] Engine active. Model: {label}. Window: {WINDOW_SECONDS}s. Iface: #{interface}\n")
 
     last_bpf = None
     while True:
         try:
+            # Re-read the pinned interface each window so the dashboard's picker
+            # takes effect without a restart. get_active_interface() shells out
+            # to `tshark -D`, so only re-resolve when the pin actually changed
+            # (and never at all when --interface was given).
+            if not cli_interface:
+                current_pin = read_capture_interface()
+                if current_pin != pinned_interface:
+                    pinned_interface = current_pin
+                    interface = current_pin or get_active_interface()
+                    suffix = "" if current_pin else " (auto-detected)"
+                    print(f"[*] capture interface -> #{interface}{suffix}")
+
             # Re-read the BPF capture filter each window so the dashboard can
             # change it live; it takes effect on the next capture (not retroactive).
             bpf = read_capture_filter()

@@ -1,5 +1,6 @@
 import hashlib
 import html as _html
+import ipaddress
 import json
 import os
 import random
@@ -8,6 +9,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import io
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +26,17 @@ import streamlit.components.v1 as components
 # path below resolves here regardless of how Streamlit was launched.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# This folder has to be on sys.path in its own right, not just as the working
+# directory. `streamlit run app.py` happens to inject the script's directory,
+# but nothing else does — not Streamlit's AppTest harness, and not a frozen
+# PyInstaller build where the modules are unpacked beside the bundle. The
+# sibling folders below are added explicitly for the same reason; this line
+# extends that to same-folder imports (evaluate_benchmark, notifier), which
+# previously worked only by inheriting Streamlit's behaviour.
+_DASH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _DASH_DIR not in sys.path:
+    sys.path.insert(0, _DASH_DIR)
 
 # ── Aaron MITRE ATT&CK mapping ───────────────────────────────────────────────
 # Pull Aaron's MITRE tagging from the sibling Aaron/ folder. Degrades gracefully
@@ -42,17 +56,168 @@ except Exception as _exc:  # missing folder — degrade gracefully
 # Resolve the sibling "Rui Yang/app" folder. The engine loads its own
 # models/rules anchored to the Rui Yang folder; nothing is moved or copied.
 _RY_APP_DIR = os.path.join(_REPO_ROOT, "Rui Yang", "app")
+_RY_SCRIPTS_DIR = os.path.join(_REPO_ROOT, "Rui Yang", "scripts")
 if _RY_APP_DIR not in sys.path:
     sys.path.insert(0, _RY_APP_DIR)
+if _RY_SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _RY_SCRIPTS_DIR)
 try:
     import plotly.express as px
-    import plotly.graph_objects as go
     from pcap_engine import analyse_pcap, get_ip_location
     PCAP_ENGINE_OK = True
     PCAP_ENGINE_ERR = None
 except Exception as _exc:  # missing folder / deps — degrade gracefully
     PCAP_ENGINE_OK = False
     PCAP_ENGINE_ERR = str(_exc)
+
+# Rui Yang's aggregated Threat Analysis Report helpers (Enhancement Idea 1).
+# Kept optional so the dashboard still loads if the scripts folder is absent.
+try:
+    from report import (
+        build_reasons as _ry_build_reasons,
+        build_actions as _ry_build_actions,
+        attack_breakdown as _ry_attack_breakdown,
+        top_attackers as _ry_top_attackers,
+        per_attack_cards as _ry_per_attack_cards,
+        rank_by_threat_score as _ry_rank_by_threat_score,
+    )
+    RY_REPORT_OK = True
+except Exception:
+    RY_REPORT_OK = False
+
+# Rui Yang's plain-English Management Report — same underlying detections as
+# the Threat Analysis Report above, reworded for a non-technical reader.
+try:
+    from management_report import (
+        build_overall_summary as _ry_build_overall_summary,
+        build_incident_cards as _ry_build_incident_cards,
+        attack_type_counts_plain as _ry_attack_type_counts_plain,
+    )
+    RY_MGMT_REPORT_OK = True
+except Exception:
+    RY_MGMT_REPORT_OK = False
+
+# Rui Yang's Word (.docx) export for both report views. Optional: needs
+# python-docx, which not every teammate's environment may have installed.
+try:
+    from docx_report import (
+        build_technical_docx as _ry_build_technical_docx,
+        build_management_docx as _ry_build_management_docx,
+    )
+    RY_DOCX_OK = True
+except Exception:
+    RY_DOCX_OK = False
+
+# Detection Benchmark tab — scores the Random Forest against a labelled
+# benchmark CSV. evaluate_benchmark.py sits in this folder and is the single
+# implementation of the metrics; the CLI (`python evaluate_benchmark.py x.csv`)
+# calls the same evaluate_dataframe(), so the console and the on-screen gauges
+# cannot disagree. Guarded like every other cross-module import here so a
+# missing/renamed file degrades this one tab instead of killing the app.
+try:
+    import evaluate_benchmark as _bench
+    BENCHMARK_OK = True
+except Exception:
+    BENCHMARK_OK = False
+
+# The packaged desktop app renders this dashboard inside a pywebview/WebView2
+# window that has NO download handler. Streamlit's st.download_button hands that
+# embedded browser a client-side blob, which WebView2 saves CORRUPTED — Word
+# then reports "the file is corrupt and cannot be opened" even though the bytes
+# python-docx produced are valid. Detect the desktop build (desktop_app.py is the
+# only thing that exports HYBRIDIDS_ROOT) and, there, write the report straight
+# to the user's Downloads folder server-side instead — the Streamlit server runs
+# on the same machine, so the exact bytes land on disk intact. The source /
+# real-browser build is unaffected and keeps the normal download button.
+_IS_DESKTOP_APP = bool(os.environ.get("HYBRIDIDS_ROOT"))
+
+
+def _save_to_downloads(data: bytes, file_name: str) -> str:
+    """Write bytes to the user's Downloads folder, never clobbering an existing
+    file, and return the path actually written."""
+    dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    if not os.path.isdir(dest_dir):
+        dest_dir = os.path.expanduser("~")
+    os.makedirs(dest_dir, exist_ok=True)
+    stem, ext = os.path.splitext(file_name)
+    out = os.path.join(dest_dir, file_name)
+    n = 1
+    while os.path.exists(out):
+        out = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+        n += 1
+    with open(out, "wb") as fh:
+        fh.write(data)
+    return out
+
+
+def _offer_binary_download(build_fn, file_name, key, label, mime,
+                           desktop_label=None, use_container_width=False):
+    """Binary download that survives the desktop build.
+
+    st.download_button hands the browser a client-side blob. The pywebview /
+    WebView2 window has no download handler, and what it saves is corrupted —
+    which is why the Word export already takes this route. Any binary payload has
+    the same problem, PCAP evidence included, so in the desktop build the file is
+    written server-side instead (the server is local, so the bytes land intact).
+
+    build_fn is called only when the user actually clicks, so reading a PCAP off
+    disk is not paid for on every rerun.
+    """
+    if _IS_DESKTOP_APP:
+        if st.button(desktop_label or f"Save {label}", key=key,
+                     use_container_width=use_container_width):
+            try:
+                st.success(f"Saved to:  {_save_to_downloads(build_fn(), file_name)}")
+            except Exception as _e:
+                st.caption(f"Save failed ({_e}).")
+    else:
+        try:
+            st.download_button(
+                label, data=build_fn(), file_name=file_name, mime=mime,
+                key=key, use_container_width=use_container_width,
+            )
+        except Exception as _e:
+            st.caption(f"Download unavailable ({_e}).")
+
+
+def _offer_word_report(build_fn, file_name, key, label="Download as Word (.docx)"):
+    """Word (.docx) export that works in BOTH the browser and desktop builds.
+
+    build_fn is a zero-arg callable returning the .docx bytes. In the desktop
+    build it is only invoked on click (and the file is saved to disk); in the
+    browser build the bytes are handed to st.download_button as before.
+    """
+    if _IS_DESKTOP_APP:
+        if st.button("Save as Word (.docx)", use_container_width=True, key=key):
+            try:
+                data = build_fn()
+                dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                if not os.path.isdir(dest_dir):
+                    dest_dir = os.path.expanduser("~")
+                os.makedirs(dest_dir, exist_ok=True)
+                stem, ext = os.path.splitext(file_name)
+                out = os.path.join(dest_dir, file_name)
+                _n = 1
+                while os.path.exists(out):     # never clobber an earlier export
+                    out = os.path.join(dest_dir, f"{stem} ({_n}){ext}")
+                    _n += 1
+                with open(out, "wb") as _f:
+                    _f.write(data)
+                st.success(f"Word report saved to:  {out}")
+            except Exception as _e:
+                st.caption(f"Word export failed ({_e}).")
+    else:
+        try:
+            st.download_button(
+                label,
+                data=build_fn(),
+                file_name=file_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key=key,
+            )
+        except Exception as _e:
+            st.caption(f"Word export unavailable ({_e}).")
 
 # ── Megan Model Intelligence (SHAP / LSTM / retraining) ──────────────────────
 # Pull Megan's v2 model-intelligence panels from the sibling Megan/ folder. Those
@@ -63,7 +228,7 @@ _MEGAN_DIR = os.path.join(_REPO_ROOT, "Megan")
 if _MEGAN_DIR not in sys.path:
     sys.path.insert(0, _MEGAN_DIR)
 try:
-    from shap_explainer import render_shap_panel
+    from shap_explainer import render_shap_panel, render_lstm_shap_panel
     from retrain_pipeline import render_retrain_panel
     MODEL_INTEL_OK = True
     MODEL_INTEL_ERR = None
@@ -442,6 +607,43 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# Active response shells out to `netsh advfirewall`, which exists only on
+# Windows. Everything else (capture, detection, scoring, alerting, reports) is
+# portable, so on macOS/Linux the block buttons report "unsupported" rather than
+# silently doing nothing or raising FileNotFoundError.
+FIREWALL_SUPPORTED = os.name == "nt"
+
+
+def _safe_upload_name(name: str) -> str:
+    """Reduce a browser-supplied upload filename to a harmless leaf name.
+
+    `st.file_uploader` hands back the client's filename verbatim; joining that
+    onto a directory lets a name like ``../../x.pcap`` escape the intended
+    folder, and this app runs elevated, so an arbitrary-file-write there is
+    worth closing off even though the uploader is only reachable from
+    localhost. Keep a conservative character set and drop every path separator.
+    """
+    leaf = os.path.basename(str(name).replace("\\", "/"))
+    leaf = re.sub(r"[^A-Za-z0-9._-]", "_", leaf).lstrip(".")
+    return f"temp_{leaf or 'upload'}.pcap" if not leaf.lower().endswith(
+        (".pcap", ".pcapng", ".cap")) else f"temp_{leaf}"
+
+
+def _is_valid_ipv4(ip_address) -> bool:
+    """True only for a well-formed IP literal.
+
+    Guards the netsh calls below. They already pass arguments as a list (no
+    shell), so this is not closing an injection hole — it stops a malformed
+    value read back out of the alert DB from being handed to a
+    firewall-modifying command at all.
+    """
+    try:
+        ipaddress.ip_address(str(ip_address).strip())
+        return True
+    except ValueError:
+        return False
+
+
 # Block state is persisted in SQLite (blocked_ips table) rather than
 # st.session_state so it survives reruns/reloads AND reflects auto-blocks written
 # by Aaron's live_backend.py. See the DB helpers below.
@@ -451,10 +653,12 @@ def apply_firewall_block(ip_address):
     """Add a Windows Defender Firewall inbound block rule for the given IP.
 
     Uses ``netsh advfirewall`` to install a rule named ``IDS_BLOCK_<ip>``.
-    Returns True on success, False if netsh exits non-zero (e.g. rule already
-    exists or insufficient privileges).
+    Returns True on success, False if the IP is malformed or netsh exits
+    non-zero (e.g. rule already exists or insufficient privileges).
     """
-    rule_name = f"IDS_BLOCK_{ip_address.replace('.', '_')}"
+    if not _is_valid_ipv4(ip_address) or os.name != "nt":
+        return False   # netsh is Windows-only; see FIREWALL_SUPPORTED
+    rule_name = f"IDS_BLOCK_{ip_address.replace('.', '_').replace(':', '_')}"
     result = subprocess.run(
         ["netsh", "advfirewall", "firewall", "add", "rule",
          f"name={rule_name}", "dir=in", "action=block", f"remoteip={ip_address}"],
@@ -464,7 +668,9 @@ def apply_firewall_block(ip_address):
 
 
 def remove_firewall_block(ip_address):
-    rule_name = f"IDS_BLOCK_{ip_address.replace('.', '_')}"
+    if not _is_valid_ipv4(ip_address) or os.name != "nt":
+        return False
+    rule_name = f"IDS_BLOCK_{ip_address.replace('.', '_').replace(':', '_')}"
     result = subprocess.run(
         ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"],
         capture_output=True, text=True
@@ -510,8 +716,12 @@ def _ensure_autoblock_tables(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL
         )
     ''')
-    conn.execute(
-        "INSERT OR IGNORE INTO capture_config (key, value) VALUES ('bpf_filter', '')"
+    conn.executemany(
+        "INSERT OR IGNORE INTO capture_config (key, value) VALUES (?, ?)",
+        # 'interface' pins the tshark interface index the capture loop listens
+        # on; empty means auto-detect. Seeded here as well as in
+        # live_backend.init_db() because either side may create the DB first.
+        [("bpf_filter", ""), ("interface", "")],
     )
     conn.commit()
 
@@ -568,6 +778,66 @@ def _write_capture_filter(bpf: str) -> None:
         (bpf.strip(),),
     )
     conn.commit()
+
+
+def _read_capture_interface() -> str:
+    """Return the pinned tshark interface index (empty string = auto-detect)."""
+    conn = _get_db_conn()
+    row = conn.execute(
+        "SELECT value FROM capture_config WHERE key='interface'"
+    ).fetchone()
+    return (row[0] if row else "").strip()
+
+
+def _write_capture_interface(index: str) -> None:
+    conn = _get_db_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO capture_config (key, value) VALUES ('interface', ?)",
+        (str(index).strip(),),
+    )
+    conn.commit()
+
+
+def _dashboard_live_backend():
+    """Import THIS folder's live_backend.py by file path, not by module name.
+
+    A bare `import live_backend` does NOT get Aalok's engine: each sibling
+    contributor folder is inserted at sys.path[0] *after* _DASH_DIR (see the
+    _AARON_DIR / _RY_APP_DIR / _RY_SCRIPTS_DIR / _MEGAN_DIR blocks above), so
+    Aaron's own live_backend.py outranks this folder's copy. His has no
+    list_capture_interfaces(), the AttributeError gets swallowed by the caller's
+    except, and the interface picker silently renders as "tshark could not list
+    interfaces" on a machine where tshark is perfectly fine. Loading by location
+    pins the import to the engine this dashboard actually drives.
+
+    Cached in sys.modules under a private name so it never collides with, or
+    shadows, whatever `live_backend` resolves to for anyone else.
+    """
+    import importlib.util
+
+    module = sys.modules.get("_dash_live_backend")
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            "_dash_live_backend", os.path.join(_DASH_DIR, "live_backend.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_dash_live_backend"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _list_capture_interfaces() -> list[tuple[str, str]]:
+    """Interfaces tshark can capture on, as [(index, friendly name)].
+
+    Cached for a minute: the dashboard reruns on every auto-refresh tick, and
+    listing interfaces spawns a tshark process. A minute is short enough that an
+    adapter connected mid-session still appears without a restart.
+    """
+    try:
+        return _dashboard_live_backend().list_capture_interfaces()
+    except Exception:
+        return []
 
 
 def _load_blocked_ips() -> pd.DataFrame:
@@ -697,9 +967,21 @@ def _load_notifier_config() -> tuple[dict, str]:
 
 
 def _save_notifier_config(cfg: dict) -> None:
-    """Write notifier_config.json (gitignored — holds plaintext SMTP creds)."""
+    """Write notifier_config.json (gitignored — holds plaintext SMTP creds).
+
+    The file is created owner-read/write only. SMTP passwords and webhook URLs
+    are stored in clear text (SMTP AUTH needs the original secret, so hashing is
+    not an option), and the default umask would otherwise leave them readable by
+    every account on a shared machine. On Windows os.chmod only toggles the
+    read-only attribute rather than applying an ACL, so the restriction is
+    best-effort there — documented in SHARE-README.md.
+    """
     with open(NOTIFIER_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(NOTIFIER_CONFIG_FILE, 0o600)
+    except OSError:
+        pass  # unsupported filesystem — the file is still written
 
 
 def render_empty_state(icon: str, title: str, desc: str):
@@ -1159,9 +1441,10 @@ def render_detection_rationale(row) -> None:
     verdict and marking the one(s) that decided the fused result.
 
     Reads the per-layer signals persisted by live_backend.write_alerts
-    (sig_heuristic / sig_rf / sig_slow / sig_dns / sig_intel / sig_baseline).
-    Caller gates on their presence; nothing here assumes a fresh schema beyond
-    that.
+    (sig_heuristic / sig_rf / sig_slow / sig_dns / sig_lstm / sig_intel /
+    sig_baseline). Caller gates on their presence; nothing here assumes a fresh
+    schema beyond that — sig_lstm in particular is absent from DBs written by a
+    pre-LSTM backend, so its row is only added when the column came through.
     """
     def _val(key, default="—"):
         v = row.get(key)
@@ -1186,6 +1469,13 @@ def render_detection_rationale(row) -> None:
         ("Random Forest (ML)",   str(_val("Sig RF")),        False),
         ("Rolling-window (slow attack)", str(_val("Sig Slow")), False),
         ("DNS-tunnel detector",  str(_val("Sig DNS")),       False),
+    ]
+    # The LSTM's raw verdict is logged uncapped; live_backend caps what it may
+    # contribute to the fused level (apply_lstm_cap), so a Severe here can
+    # legitimately not be the deciding layer.
+    if "Sig LSTM" in row.index:
+        layers.append(("LSTM sequence model", str(_val("Sig LSTM")), False))
+    layers += [
         ("Threat-intel feed",
          "Match — forces Severe" if intel_hit else "No match", intel_hit),
         ("Baseline whitelist",
@@ -1317,7 +1607,7 @@ def render_flow_detail(row) -> None:
     # Full field dump (everything we loaded for this row, minus internal keys
     # and the per-layer signals, which get their own rationale panel below).
     _skip = {"id", "Evidence Path", "Sig Heuristic", "Sig RF", "Sig Slow",
-             "Sig DNS", "Sig Intel", "Sig Baseline",
+             "Sig DNS", "Sig LSTM", "Sig Intel", "Sig Baseline",
              "Threat Score", "Risk Band", "Score Reasons", "Score Actions",
              "Score Breakdown"}
     detail_items = [
@@ -1407,11 +1697,21 @@ def render_flow_detail(row) -> None:
 
 
 def _theme_plotly(fig):
-    """Warm-dark Anthropic styling for plotly figures (charcoal/cream)."""
+    """Warm-dark Anthropic styling for plotly figures (charcoal/cream).
+
+    Setting title_font alone (without title.text) left the title's text
+    unset; the Plotly.js rendering path then coerced that missing value to
+    the literal string "undefined" and displayed it as the chart's title.
+    Explicitly carrying the existing text (or "" if there wasn't one)
+    through title= avoids ever leaving text unset.
+    """
     fig.update_layout(
         paper_bgcolor="#1A1918", plot_bgcolor="#1A1918",
         font=dict(family="Inter, sans-serif", color="#C9C7BE"),
-        title_font=dict(family="Source Serif 4, Georgia, serif", color="#FAF9F5"),
+        title=dict(
+            text=fig.layout.title.text or "",
+            font=dict(family="Source Serif 4, Georgia, serif", color="#FAF9F5"),
+        ),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
     )
     fig.update_xaxes(gridcolor="#2B2A28", zerolinecolor="#2B2A28")
@@ -1471,6 +1771,9 @@ def load_threat_logs():
         has_ports = 'dominant_transport' in existing_cols
         has_src_ports = 'top_source_port' in existing_cols
         has_signals = 'sig_rf' in existing_cols
+        # sig_lstm arrived after the other five, so a DB written by an older
+        # backend has the signals block but not this column — gate it separately.
+        has_lstm_sig = 'sig_lstm' in existing_cols
         has_score = 'threat_score' in existing_cols
 
         conf_col = 'ROUND(confidence * 100, 1) AS "Confidence (%)",' if has_confidence else ""
@@ -1500,6 +1803,7 @@ def load_threat_logs():
             'sig_rf        AS "Sig RF",'
             'sig_slow      AS "Sig Slow",'
             'sig_dns       AS "Sig DNS",'
+            + ('sig_lstm AS "Sig LSTM",' if has_lstm_sig else "") +
             'sig_intel     AS "Sig Intel",'
             'sig_baseline  AS "Sig Baseline",'
         ) if has_signals else ""
@@ -1914,9 +2218,10 @@ with _wc_btn:
     if st.button("How to use", use_container_width=True, key="welcome_overlay_btn"):
         show_welcome_overlay()
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Live SOC Dashboard", "Educational Simulator", "PCAP Analysis",
-     "Threat Map", "Model Intelligence", "Defense Config"]
+     "Threat Map", "Model Intelligence", "Defense Config",
+     "Detection Benchmark"]
 )
 
 with tab1:
@@ -1942,6 +2247,66 @@ with tab1:
     )
     st.sidebar.caption(f"Detection Engine: {detection_engine_status()}")
 
+    # ── Capture interface ─────────────────────────────────────────────────────
+    # Which adapter the engine listens on. Saved to capture_config in
+    # ids_logs.db; live_backend re-reads it each window, so a change applies
+    # without restarting the capture loop.
+    #
+    # This exists because auto-detect resolves the DEFAULT-ROUTE adapter, and
+    # test traffic frequently is not on it: attacking from a VM puts packets on
+    # a VMnet adapter, attacking localhost puts them on the Npcap loopback
+    # adapter, and an active VPN moves the default route off the real NIC. The
+    # engine then captures a quiet interface and logs "no packets in window"
+    # while the attack is running — which reads exactly like a broken detector.
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Capture Interface**")
+    _ifaces = _list_capture_interfaces()
+    _cur_iface = _read_capture_interface()
+    _AUTO_LABEL = "Auto-detect (default route)"
+
+    if not _ifaces:
+        st.sidebar.caption(
+            "tshark could not list interfaces — check the Wireshark install. "
+            "The engine falls back to auto-detect."
+        )
+    else:
+        _labels = [_AUTO_LABEL] + [f"#{i} — {n}" for i, n in _ifaces]
+        _iface_by_label = {f"#{i} — {n}": i for i, n in _ifaces}
+        # A pinned index whose adapter has since disappeared (VM shut down, VPN
+        # dropped) must still appear, or the box would silently read "Auto"
+        # while the engine is still pinned to a missing interface.
+        if _cur_iface and _cur_iface not in [i for i, _ in _ifaces]:
+            _gone = f"#{_cur_iface} — (adapter not present)"
+            _labels.append(_gone)
+            _iface_by_label[_gone] = _cur_iface
+        _sel = 0
+        if _cur_iface:
+            for _pos, _lab in enumerate(_labels):
+                if _iface_by_label.get(_lab) == _cur_iface:
+                    _sel = _pos
+                    break
+        _iface_choice = st.sidebar.selectbox(
+            "Listen on", _labels, index=_sel, key="iface_select",
+            help=(
+                "The network adapter packets are captured from. Auto-detect "
+                "picks whichever adapter carries the default route — correct "
+                "for internet traffic, wrong for a VM, a second NIC, or a "
+                "localhost test. Pick the loopback adapter to detect attacks "
+                "against 127.0.0.1. Applies to the NEXT capture window."
+            ),
+        )
+        if st.sidebar.button("Apply interface", key="iface_save",
+                             use_container_width=True):
+            _cur_iface = _iface_by_label.get(_iface_choice, "")
+            _write_capture_interface(_cur_iface)
+            st.sidebar.success("Capture interface saved — next window.")
+
+    if _cur_iface:
+        _pinned_name = dict(_ifaces).get(_cur_iface, "adapter not present")
+        st.sidebar.caption(f"Pinned: #{_cur_iface} — {_pinned_name}")
+    else:
+        st.sidebar.caption("Auto-detecting the default-route adapter.")
+
     # ── Capture filter (BPF) ──────────────────────────────────────────────────
     # Wireshark-style CAPTURE filter: a libpcap/BPF expression saved to
     # capture_config in ids_logs.db. live_backend.py re-reads it each window and
@@ -1961,14 +2326,27 @@ with tab1:
             "Leave blank to capture everything. Applies to the NEXT window."
         ),
     )
+    def _clear_capture_filter():
+        # A widget's own session_state key may only be written BEFORE that
+        # widget is instantiated. As an on_click callback this runs ahead of
+        # the rerun, so blanking bpf_input here is legal — doing it inline
+        # after the text_input above raised StreamlitAPIException
+        # ("`st.session_state.bpf_input` cannot be modified after the widget
+        # with key `bpf_input` is instantiated") and crashed the whole page.
+        _write_capture_filter("")
+        st.session_state["bpf_input"] = ""
+
     _bc1, _bc2 = st.sidebar.columns(2)
     if _bc1.button("Save", key="bpf_save", use_container_width=True):
         _write_capture_filter(_bpf_in)
         st.sidebar.success("Capture filter saved.")
-    if _bc2.button("Clear", key="bpf_clear", use_container_width=True):
-        _write_capture_filter("")
-        st.session_state["bpf_input"] = ""
-        st.rerun()
+    # No st.rerun() — a button with on_click already reruns the script, and by
+    # then _read_capture_filter() above returns the cleared value, so the
+    # "Active:" caption below is correct on the very same pass.
+    _bc2.button(
+        "Clear", key="bpf_clear", use_container_width=True,
+        on_click=_clear_capture_filter,
+    )
     if _cur_bpf:
         st.sidebar.caption(f"Active: `{_cur_bpf}` — next window")
     else:
@@ -2192,6 +2570,88 @@ with tab1:
                         # Simple main table: a few key columns only. The full record
                         # lives in view100 and is surfaced on row click below.
                         view100 = view_df.head(100).reset_index(drop=True)
+
+                        # ── Sticky row selection ──────────────────────────────
+                        # This panel is an st.fragment that re-queries the DB
+                        # every refresh_rate seconds, so fresh flows land at the
+                        # top and every existing row shifts down. Streamlit
+                        # stores a dataframe selection by ROW POSITION, not by
+                        # row identity, so a shifting table silently re-points
+                        # the tick box — and the drill-down below it — at
+                        # whichever flow slid into that slot.
+                        #
+                        # Fix: while a row is selected, FREEZE the rendered
+                        # snapshot. The positions the widget remembers keep
+                        # meaning the same flow, so the selection stays on the
+                        # row the analyst actually clicked. The rest of the page
+                        # (metrics, charts, kill chain) keeps updating live and
+                        # the table resumes the moment the selection is cleared.
+                        _sel_epoch = st.session_state.get("_telemetry_sel_epoch", 0)
+                        _sel_key = f"telemetry_select_{_sel_epoch}"
+
+                        def _clear_telemetry_selection():
+                            # A dataframe selection cannot be cleared through
+                            # session_state, so retire the widget key instead:
+                            # a new key is a new widget, with no selection.
+                            st.session_state["_telemetry_sel_epoch"] = (
+                                st.session_state.get("_telemetry_sel_epoch", 0) + 1
+                            )
+                            st.session_state.pop("_telemetry_frozen", None)
+                            st.session_state.pop("_telemetry_shown", None)
+                            try:
+                                # The retired key is never rendered again — drop
+                                # its state so long sessions do not accumulate a
+                                # dead selection dict per pin/unpin cycle.
+                                del st.session_state[_sel_key]
+                            except Exception:
+                                pass
+
+                        # What the widget reported on the previous run. Read it
+                        # before rendering: the freeze decision has to be made
+                        # while this run's table is still being built.
+                        _prev_rows = []
+                        _prev_state = st.session_state.get(_sel_key)
+                        if _prev_state is not None:
+                            try:
+                                _prev_rows = list(_prev_state["selection"]["rows"])
+                            except Exception:
+                                try:
+                                    _prev_rows = list(_prev_state.selection.rows)
+                                except Exception:
+                                    _prev_rows = []
+
+                        # A filter change means the analyst asked for a different
+                        # slice of traffic — honour that and drop any freeze.
+                        _filter_sig = (
+                            tuple(sorted(severity_filter)),
+                            tuple(sorted(transport_filter)),
+                            int(port_filter or 0),
+                            ip_query.strip().lower(),
+                        )
+                        if st.session_state.get("_telemetry_filter_sig") != _filter_sig:
+                            st.session_state["_telemetry_filter_sig"] = _filter_sig
+                            st.session_state.pop("_telemetry_frozen", None)
+                            st.session_state.pop("_telemetry_shown", None)
+                            _prev_rows = []
+
+                        _frozen = st.session_state.get("_telemetry_frozen")
+                        if not _prev_rows:
+                            # Nothing selected — the table runs live again.
+                            _frozen = None
+                            st.session_state.pop("_telemetry_frozen", None)
+                        elif _frozen is None:
+                            # A selection appeared this run. It was made against
+                            # the snapshot that was last on screen, so that is
+                            # the frame to freeze — not the fresher one just
+                            # pulled from the DB, in which the rows have already
+                            # moved.
+                            _frozen = st.session_state.get("_telemetry_shown")
+                            if _frozen is not None:
+                                st.session_state["_telemetry_frozen"] = _frozen
+
+                        table_df = view100 if _frozen is None else _frozen
+                        st.session_state["_telemetry_shown"] = table_df
+
                         # Ordered as a readable flow tuple: who (Source IP:Source Port)
                         # → over what (Transport) → to where (Dest Port), then the
                         # rate and the verdict. Ports only appear when the backend has
@@ -2200,9 +2660,9 @@ with tab1:
                             c for c in ("Time", "Source IP", "Source Port", "Transport",
                                         "Dest Port", "Packets/Sec", "Threat Score",
                                         "Threat Level")
-                            if c in view100.columns
+                            if c in table_df.columns
                         ]
-                        simple_df = view100[_key_cols]
+                        simple_df = table_df[_key_cols]
                         # Ports are identifiers, not magnitudes: render them as bare
                         # integers (no 59,272 thousands-grouping) with hover help.
                         _port_help = {
@@ -2220,26 +2680,98 @@ with tab1:
                             _sel = st.dataframe(
                                 _styled, width="stretch", height=420,
                                 on_select="rerun", selection_mode="single-row",
-                                hide_index=True, key="telemetry_select",
+                                hide_index=True, key=_sel_key,
                                 column_config=_col_config,
                             )
                         except Exception:
                             _sel = st.dataframe(
                                 simple_df, width="stretch", height=420,
                                 on_select="rerun", selection_mode="single-row",
-                                hide_index=True, key="telemetry_select",
+                                hide_index=True, key=_sel_key,
                                 column_config=_col_config,
                             )
+
+                        if _frozen is not None:
+                            _fz_txt, _fz_btn = st.columns([3, 1])
+                            with _fz_txt:
+                                st.caption(
+                                    "Selection pinned — this table is paused so the "
+                                    "selected flow cannot slide out from under you. "
+                                    "Capture and every other panel keep running live."
+                                )
+                            with _fz_btn:
+                                st.button(
+                                    "Resume live table", key="telemetry_resume",
+                                    on_click=_clear_telemetry_selection,
+                                    use_container_width=True,
+                                )
 
                         csv_bytes = view_df.drop(
                             columns=[c for c in ("id",) if c in view_df.columns]
                         ).to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            label="Export Filtered Logs (CSV)",
-                            data=csv_bytes,
-                            file_name=f"ids_threat_logs_{int(time.time())}.csv",
-                            mime="text/csv",
-                        )
+
+                        # Always offer the current live capture if present. This reads
+                        # the snapshot file `temp_live.pcap` from the Dashboard folder
+                        # and serves it to the browser. If the backend isn't writing
+                        # a live file, the button is hidden and we fall back to CSV.
+                        live_pcap = "temp_live.pcap"
+                        if os.path.exists(live_pcap):
+                            try:
+                                with open(live_pcap, "rb") as fh:
+                                    live_bytes = fh.read()
+                                st.download_button(
+                                    label="Download current capture (PCAP)",
+                                    data=live_bytes,
+                                    file_name=f"temp_live_{int(time.time())}.pcap",
+                                    mime="application/vnd.tcpdump.pcap",
+                                    key="live_pcap_dl",
+                                )
+                            except Exception:
+                                st.caption("Live PCAP currently unavailable")
+
+                        # If the filtered view references captured PCAP evidence files,
+                        # offer them as direct downloads (single PCAP) or a ZIP archive
+                        # of multiple PCAPs. Otherwise fall back to the CSV export.
+                        pcap_paths = []
+                        if "Evidence Path" in view_df.columns:
+                            pcap_paths = [p for p in view_df["Evidence Path"].dropna().unique()]
+                        existing_pcaps = [p for p in pcap_paths if os.path.exists(p)]
+
+                        if len(existing_pcaps) == 1:
+                            p = existing_pcaps[0]
+                            _offer_binary_download(
+                                lambda _p=p: open(_p, "rb").read(),
+                                file_name=os.path.basename(p),
+                                key=f"evdl_single_{p}",
+                                label="Download PCAP",
+                                desktop_label="Save PCAP",
+                                mime="application/vnd.tcpdump.pcap",
+                            )
+                        elif len(existing_pcaps) > 1:
+                            buf = io.BytesIO()
+                            with zipfile.ZipFile(buf, "w") as zf:
+                                for p in existing_pcaps:
+                                    try:
+                                        zf.write(p, arcname=os.path.basename(p))
+                                    except Exception:
+                                        # skip unreadable files
+                                        pass
+                            buf.seek(0)
+                            _offer_binary_download(
+                                buf.getvalue,
+                                file_name=f"ids_evidence_pcaps_{int(time.time())}.zip",
+                                key="evdl_zip",
+                                label=f"Download {len(existing_pcaps)} PCAPs (zip)",
+                                desktop_label=f"Save {len(existing_pcaps)} PCAPs (zip)",
+                                mime="application/zip",
+                            )
+                        else:
+                            st.download_button(
+                                label="Export Filtered Logs (CSV)",
+                                data=csv_bytes,
+                                file_name=f"ids_threat_logs_{int(time.time())}.csv",
+                                mime="text/csv",
+                            )
 
                         # ── Click-row drill-down ──────────────────────────────────
                         _rows = []
@@ -2247,12 +2779,15 @@ with tab1:
                             _rows = list(_sel.selection.rows)
                         except Exception:
                             _rows = []
-                        if _rows and _rows[0] < len(view100):
+                        if _rows and _rows[0] < len(table_df):
                             st.markdown(
                                 '<div class="section-divider"></div>',
                                 unsafe_allow_html=True,
                             )
-                            render_flow_detail(view100.iloc[_rows[0]])
+                            # table_df, not view100: while pinned the detail has
+                            # to describe the frozen row, not whatever now sits
+                            # at that position in the live query.
+                            render_flow_detail(table_df.iloc[_rows[0]])
                         else:
                             st.caption(
                                 "Click a row to inspect the full flow — ports, protocol "
@@ -2292,14 +2827,14 @@ with tab1:
                                     )
                                 with ev_col_btn:
                                     if os.path.exists(ev_path):
-                                        with open(ev_path, "rb") as fh:
-                                            st.download_button(
-                                                label="PCAP",
-                                                data=fh.read(),
-                                                file_name=os.path.basename(ev_path),
-                                                mime="application/vnd.tcpdump.pcap",
-                                                key=f"evdl_{ev_path}",
-                                            )
+                                        _offer_binary_download(
+                                            lambda _p=ev_path: open(_p, "rb").read(),
+                                            file_name=os.path.basename(ev_path),
+                                            key=f"evdl_{ev_path}",
+                                            label="PCAP",
+                                            desktop_label="Save",
+                                            mime="application/vnd.tcpdump.pcap",
+                                        )
                                     else:
                                         st.caption("file missing")
 
@@ -2516,10 +3051,43 @@ with tab1:
                 severe_ips = severe_df["Source IP"].unique().tolist()
                 unmitigated = [ip for ip in severe_ips if ip not in _current_blocked_ips]
 
+                # ── Auto-block enforcement (Aaron) ───────────────────────────
+                # Second enforcement point, deliberately. live_backend applies the
+                # same policy per capture window, which is what makes auto-block
+                # work headlessly (START.bat, the .exe, dashboard closed). This one
+                # acts on what is actually on screen: it blocks the moment the view
+                # shows an IP over threshold, instead of on the backend's next
+                # window, and it covers rows that arrived from a replay or an
+                # imported database rather than from live capture.
+                # The two cannot fight: both go through blocked_ips, _maybe_auto_block
+                # skips IPs already in that table, and this loop only considers IPs
+                # not already blocked.
+                _ab_cfg = _read_autoblock_config()
+                if _ab_cfg["enabled"] and unmitigated:
+                    _hit_counts = severe_df["Source IP"].value_counts()
+                    _auto_blocked_now = []
+                    for ip in unmitigated:
+                        if int(_hit_counts.get(ip, 0)) >= _ab_cfg["threshold"]:
+                            if _block_ip_to_db(
+                                ip, _ab_cfg["ttl_seconds"],
+                                f"Auto-block: {int(_hit_counts[ip])} Severe hits "
+                                f"(threshold {_ab_cfg['threshold']})"
+                            ):
+                                _auto_blocked_now.append(ip)
+                    if _auto_blocked_now:
+                        # Refresh block state so the panel below reflects the
+                        # auto-blocks immediately instead of on the next rerun.
+                        _current_blocked_ips |= set(_auto_blocked_now)
+                        unmitigated = [ip for ip in unmitigated if ip not in _current_blocked_ips]
+                        st.info(
+                            f"Auto-block engaged for {len(_auto_blocked_now)} source(s): "
+                            f"{', '.join(_auto_blocked_now)}."
+                        )
+
                 if unmitigated:
                     st.warning(f"{len(unmitigated)} critical threat source(s) detected and awaiting mitigation.")
 
-                    _block_ttl = _read_autoblock_config()["ttl_seconds"]
+                    _block_ttl = _ab_cfg["ttl_seconds"]  # already read just above
 
                     for ip in unmitigated:
                         ip_flows = len(severe_df[severe_df["Source IP"] == ip])
@@ -3147,15 +3715,29 @@ with tab3:
         )
 
         if uploaded:
-            tmp_path = os.path.join(_RY_APP_DIR, f"temp_{uploaded.name}")
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded.read())
-            try:
-                with st.spinner("Analysing PCAP file…"):
-                    df_results = analyse_pcap(tmp_path)
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            # Streamlit reruns this whole script on ANY widget interaction
+            # anywhere on the page (e.g. the report-view toggle below, or a
+            # filter on another tab), not just on a new upload. Without this
+            # cache, every such rerun would re-run analyse_pcap() on the same
+            # file, and since it calls offender_history.record() for every
+            # alert flow, repeat reruns silently re-recorded the same flows as
+            # new offences, inflating "Prior Hits" in the persistent DB. Only
+            # (re-)analyse when the uploaded file itself has actually changed.
+            _upload_key = (uploaded.name, uploaded.size)
+            if st.session_state.get("pcap_upload_key") != _upload_key:
+                tmp_path = os.path.join(_RY_APP_DIR, _safe_upload_name(uploaded.name))
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded.read())
+                try:
+                    with st.spinner("Analysing PCAP file…"):
+                        df_results = analyse_pcap(tmp_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                st.session_state["pcap_upload_key"] = _upload_key
+                st.session_state["pcap_df_results"] = df_results
+            else:
+                df_results = st.session_state["pcap_df_results"]
 
             # The PCAP engine prefixes Severity with a status emoji (e.g. a red
             # circle before "Severe"). Strip any leading non-word chars to a plain
@@ -3210,6 +3792,15 @@ with tab3:
                             title="What caught the attacks?",
                             color_discrete_sequence=["#D97757", "#97C0A4", "#E0B65C", "#6B87A8"],
                         )
+                        # Default right-side legend placement gets clipped by
+                        # the container edge in this half-width column,
+                        # truncating longer labels (e.g. "Rule + ML" -> "Rule
+                        # + N"). A horizontal legend below the chart has the
+                        # full column width to lay out in instead.
+                        fig2.update_layout(legend=dict(
+                            orientation="h", yanchor="bottom", y=-0.3,
+                            xanchor="center", x=0.5,
+                        ))
                         st.plotly_chart(_theme_plotly(fig2), use_container_width=True)
                     else:
                         st.info("No attacks detected to attribute.")
@@ -3219,6 +3810,208 @@ with tab3:
                 alerts = df_results[df_results["Severity"] != "Safe"]
                 if not alerts.empty:
                     st.dataframe(alerts, width="stretch")
+
+                    # ── Threat Analysis Report (Rui Yang · Enhancement Idea 1) ─
+                    # Aggregated, always-visible report directly under the alert
+                    # table — no row-click needed. Reuses Rui Yang's report.py
+                    # helpers; degrades silently if that module isn't importable.
+                    if RY_REPORT_OK:
+                        st.markdown('<div class="section-divider"></div>',
+                                    unsafe_allow_html=True)
+                        st.markdown(
+                            '<p class="threat-header">Incident Report</p>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # ── Technical / Management view toggle ────────────
+                        if "pcap_report_view" not in st.session_state:
+                            st.session_state["pcap_report_view"] = "technical"
+                        _tcol, _mcol = st.columns(2)
+                        if _tcol.button(
+                            "Technical Report", use_container_width=True, key="pcap_view_tech",
+                            type="primary" if st.session_state["pcap_report_view"] == "technical" else "secondary",
+                        ):
+                            st.session_state["pcap_report_view"] = "technical"
+                            st.rerun()
+                        if _mcol.button(
+                            "Management Report", use_container_width=True, key="pcap_view_mgmt",
+                            type="primary" if st.session_state["pcap_report_view"] == "management" else "secondary",
+                        ):
+                            st.session_state["pcap_report_view"] = "management"
+                            st.rerun()
+
+                        if "Threat Score" in alerts.columns:
+                            _ov = int(pd.to_numeric(
+                                alerts["Threat Score"], errors="coerce"
+                            ).max())
+                        else:
+                            _ov = 0
+                        _band, _bcol = (
+                            ("Normal", "#97C0A4") if _ov <= 20 else
+                            ("Low", "#9FC08A")     if _ov <= 40 else
+                            ("Medium", "#E0B65C")  if _ov <= 60 else
+                            ("High", "#F0A063")    if _ov <= 80 else
+                            ("Critical", "#F0795A")
+                        )
+
+                        if st.session_state["pcap_report_view"] == "technical":
+                            st.markdown(
+                                "<div style='display:flex;align-items:baseline;gap:12px;"
+                                "margin-bottom:6px'>"
+                                f"<span style='font-size:40px;font-weight:800;color:{_bcol};"
+                                "font-family:JetBrains Mono,monospace;line-height:1'>"
+                                f"{_ov}</span><span style='color:#7C7A70'>/ 100</span>"
+                                f"<span style='font-size:14px;font-weight:700;color:{_bcol};"
+                                f"letter-spacing:.06em'>{_band.upper()}</span></div>"
+                                "<div style='height:10px;border-radius:6px;background:#2B2A28;"
+                                "overflow:hidden'>"
+                                f"<div style='width:{max(0,min(100,_ov))}%;height:100%;"
+                                f"background:{_bcol}'></div></div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            st.markdown("**Detected**")
+                            for _atk, _cnt in _ry_attack_breakdown(alerts).most_common():
+                                st.markdown(f"- {_atk} — {_cnt} flow(s)")
+
+                            _rc1, _rc2 = st.columns(2)
+                            with _rc1:
+                                st.markdown("**Possible reasons**")
+                                for _r in _ry_build_reasons(alerts):
+                                    st.markdown(f"- {_r}")
+                            with _rc2:
+                                st.markdown("**Suggested actions**")
+                                for _a in _ry_build_actions(alerts):
+                                    st.markdown(f"- {_a}")
+
+                            st.markdown("**Top attacking sources**")
+                            _att = _ry_top_attackers(alerts, get_ip_location, limit=5)
+                            st.dataframe(pd.DataFrame(_att), width="stretch",
+                                         hide_index=True)
+
+                            # ── Per-attack detail cards (only when few attacks) ──
+                            # 5 or fewer alerts -> give each its own focused card;
+                            # beyond that the aggregate above plus the flow table is
+                            # clearer than a long stack of cards. Wrapped defensively
+                            # so an older Streamlit (no border= / width=) or a bad
+                            # row can't blank out the whole report.
+                            _PER_ATTACK_LIMIT = 5
+                            try:
+                                _n_alerts = len(alerts)
+                                # Always show the first N (matching the Management
+                                # view below) instead of an all-or-nothing cutoff -
+                                # that previously meant 6+ alerts showed ZERO
+                                # per-attack detail on screen here. "First N" is
+                                # now highest Threat Score, not just whichever
+                                # happened to appear earliest.
+                                st.markdown(
+                                    '<p class="threat-header" '
+                                    'style="margin-top:14px;">Per-Attack '
+                                    'Breakdown</p>',
+                                    unsafe_allow_html=True,
+                                )
+                                _ranked_alerts = _ry_rank_by_threat_score(alerts)
+                                for _card in _ry_per_attack_cards(
+                                        _ranked_alerts.head(_PER_ATTACK_LIMIT), get_ip_location):
+                                    st.markdown(
+                                        f"**{_card['reason_name']}** "
+                                        f"— Score {_card['score']} "
+                                        f"({_card['level']})"
+                                    )
+                                    st.markdown(
+                                        f"`{_card['src']}` → `{_card['dst']}` "
+                                        f": port {_card['port']}"
+                                    )
+                                    st.markdown(f"**Why:** {_card['why']}")
+                                    st.markdown(f"**Action:** {_card['action']}")
+                                    st.caption(f"Origin: {_card['origin']}")
+                                    st.markdown(
+                                        '<div class="section-divider"></div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                if _n_alerts > _PER_ATTACK_LIMIT:
+                                    st.info(
+                                        f"{_n_alerts - _PER_ATTACK_LIMIT} additional attack(s) "
+                                        "not shown here; per-flow detail is in the flow table, "
+                                        "or download the Word report below for full detail."
+                                    )
+                            except Exception as _card_err:
+                                st.caption(
+                                    "Per-attack breakdown unavailable "
+                                    f"({_card_err})."
+                                )
+
+                            if RY_DOCX_OK:
+                                _offer_word_report(
+                                    lambda: _ry_build_technical_docx(
+                                        alerts, _ov, f"{_band}", get_ip_location
+                                    ),
+                                    "threat_analysis_report.docx",
+                                    "pcap_docx_tech",
+                                )
+
+                        elif not RY_MGMT_REPORT_OK:
+                            st.warning(
+                                "Management report module could not be loaded "
+                                "(management_report.py missing from Rui Yang/scripts)."
+                            )
+                        else:
+                            # ── Management Report (plain English) ─────────
+                            try:
+                                st.info(_ry_build_overall_summary(alerts, _ov, f"{_band}"))
+
+                                st.markdown("**What was detected**")
+                                for _label, _cnt in _ry_attack_type_counts_plain(alerts).most_common():
+                                    _cnt_word = "event" if _cnt == 1 else "events"
+                                    st.markdown(f"- {_label} — {_cnt} {_cnt_word}")
+
+                                st.markdown(
+                                    '<p class="threat-header" '
+                                    'style="margin-top:14px;">Incident Details</p>',
+                                    unsafe_allow_html=True,
+                                )
+                                _MGMT_CARD_LIMIT = 5
+                                _mgmt_cards = _ry_build_incident_cards(
+                                    _ry_rank_by_threat_score(alerts), get_ip_location)
+                                for _card in _mgmt_cards[:_MGMT_CARD_LIMIT]:
+                                    st.markdown(
+                                        f"**Source:** {_card['origin']}  \n"
+                                        f"**When:** {_card['start']} to {_card['end']}  \n"
+                                        f"**Rating:** {_card['level']}"
+                                    )
+                                    st.markdown(f"**What happened:** {_card['what']}")
+                                    st.markdown(f"**Data exposure:** {_card['exposure']}")
+                                    st.markdown(f"**Severity:** {_card['severity_sentence']}")
+                                    st.markdown(
+                                        f"**Recommended next step / lesson learnt:** {_card['takeaway']}"
+                                    )
+                                    if _card["prior"]:
+                                        _prior_word = "prior incident" if _card['prior'] == 1 else "prior incidents"
+                                        st.caption(
+                                            f"This source has {_card['prior']} {_prior_word} on record."
+                                        )
+                                    st.markdown(
+                                        '<div class="section-divider"></div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                if len(_mgmt_cards) > _MGMT_CARD_LIMIT:
+                                    _extra_n = len(_mgmt_cards) - _MGMT_CARD_LIMIT
+                                    _extra_word = "additional lower-priority event" if _extra_n == 1 else "additional lower-priority events"
+                                    st.info(
+                                        f"{_extra_n} {_extra_word} not shown here — see the "
+                                        "Technical Report for the full list."
+                                    )
+
+                                if RY_DOCX_OK:
+                                    _offer_word_report(
+                                        lambda: _ry_build_management_docx(
+                                            alerts, _ov, f"{_band}", get_ip_location
+                                        ),
+                                        "management_incident_report.docx",
+                                        "pcap_docx_mgmt",
+                                    )
+                            except Exception as _mgmt_err:
+                                st.caption(f"Management report unavailable ({_mgmt_err}).")
 
                     # ── Flow Triage — Raw Hex Inspector ───────────────────────
                     # Same scoped inspector as the Live SOC tab, fed by Rui
@@ -3299,6 +4092,174 @@ with tab3:
                 st.session_state["pcap_results"] = df_results
 
 
+# Animated Leaflet flow map for tab4 — attacker/normal points animate along
+# a line toward a fixed anchor ("My Computer"). Plotly's geo traces can't do
+# smooth moving markers inside Streamlit without full-script reruns, so this
+# renders as a self-contained iframe via components.html(), same pattern the
+# dashboard already uses elsewhere (e.g. the attack-simulation canvas above).
+_THREAT_FLOW_MAP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; padding: 0; background: #141413; }
+  #map { width: 100%; height: 540px; background: #141413; }
+  .leaflet-container { background: #141413; font-family: 'Inter', 'Segoe UI', sans-serif; }
+  .leaflet-popup-content-wrapper {
+    background: #1E1D1B; color: #FAF9F5; border: 1px solid #2B2A28; border-radius: 8px;
+  }
+  .leaflet-popup-content { font-size: 12.5px; line-height: 1.5; margin: 8px 10px; }
+  .leaflet-popup-content b { color: #F0795A; }
+  .leaflet-popup-tip { background: #1E1D1B; }
+  .flow-legend {
+    position: absolute; bottom: 10px; left: 10px; z-index: 1000;
+    background: rgba(26,25,24,0.85); border: 1px solid #2B2A28; border-radius: 8px;
+    padding: 8px 12px; font-family: 'Inter', sans-serif; font-size: 11.5px; color: #C9C7BE;
+  }
+  .flow-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .flow-legend div { margin: 2px 0; }
+  .flow-label {
+    background: rgba(20,20,19,0.82); border: none; box-shadow: none;
+    color: #FAF9F5; font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+    padding: 1px 5px; border-radius: 4px; pointer-events: none;
+  }
+  .flow-label.attack-label { color: #F0795A; }
+  .flow-label.normal-label { color: #C9C7BE; opacity: 0.8; }
+  .flow-label::before { display: none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="flow-legend">
+  <div><span class="dot" style="background:#F0795A;"></span>Malicious traffic &rarr; My Computer</div>
+  <div><span class="dot" style="background:#FAFAFA;"></span>Normal traffic &rarr; My Computer</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function () {
+  var ANCHOR = [__ANCHOR_LAT__, __ANCHOR_LON__];
+  var ATTACK_POINTS = __ATTACK_POINTS__;
+  var NORMAL_POINTS = __NORMAL_POINTS__;
+
+  var map = L.map('map', { zoomControl: true }).setView(ANCHOR, 2);
+
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; <a href="https://carto.com/attributions">CARTO</a> &copy; OpenStreetMap contributors',
+    subdomains: 'abcd',
+    maxZoom: 19,
+  }).addTo(map);
+
+  L.marker(ANCHOR, {
+    icon: L.divIcon({
+      className: '',
+      html: '<div style="width:16px;height:16px;border-radius:50%;background:#97C0A4;' +
+            'border:2px solid #FAF9F5;box-shadow:0 0 12px 4px rgba(151,192,164,0.6);"></div>',
+      iconSize: [16, 16], iconAnchor: [8, 8],
+    }),
+  }).addTo(map)
+    .bindPopup('<b>My Computer</b><br>Monitored network')
+    .bindTooltip('My Computer', {
+      permanent: true, direction: 'top', offset: [0, -10], className: 'flow-label',
+    });
+
+  // Interpolating raw lat/lon puts the dot off the line: Leaflet draws the
+  // polyline straight in *projected* pixel space (Web Mercator), which is a
+  // different curve than a straight line in lat/lon space, especially over
+  // long distances. Projecting both endpoints and interpolating in pixel
+  // space keeps the dot exactly on the line Leaflet actually renders.
+  function lerpOnMap(from, to, t) {
+    var zoom = map.getZoom();
+    var p1 = map.project(from, zoom);
+    var p2 = map.project(to, zoom);
+    var px = p1.add(p2.subtract(p1).multiplyBy(t));
+    return map.unproject(px, zoom);
+  }
+
+  // Mirrors the engine's own packet-rate normalization (Flow Packets/s / 500,
+  // capped at 5 — see pkt_score in pcap_engine.py) so "fast" on the map means
+  // the same thing as "fast" to the scoring model: a DDoS flood races in,
+  // a slow scan crawls.
+  function speedFor(pps, maxMs, minMs) {
+    var intensity = Math.min((pps || 0) / 500, 5);
+    return maxMs - (intensity / 5) * (maxMs - minMs);
+  }
+
+  function addFlow(point, opts) {
+    var from = L.latLng(point.lat, point.lon);
+    var to = L.latLng(ANCHOR[0], ANCHOR[1]);
+    var popupHtml = '<b>' + point.ip + '</b><br>' +
+      (point.city ? point.city + ', ' : '') + point.country + '<br>' +
+      (point.reason ? point.reason + '<br>' : '') +
+      opts.label + ': ' + point.weight +
+      (point.pps ? ' &middot; ' + Math.round(point.pps) + ' pkt/s' : '');
+
+    var line = L.polyline([from, to], {
+      color: opts.color, weight: opts.lineWeight, opacity: opts.lineOpacity,
+    }).addTo(map);
+    line.bindPopup(popupHtml);
+    line.on('mouseover', function () { line.setStyle({ opacity: Math.min(opts.lineOpacity * 2.5, 0.9) }); });
+    line.on('mouseout', function () { line.setStyle({ opacity: opts.lineOpacity }); });
+
+    // Fixed marker at the true source location, separate from the animated
+    // dot below — the moving dot alone gives the line no readable origin,
+    // so this pins a permanent location label right where the flow
+    // originates. City is more compact than a full IP; the IP itself is
+    // still in the popup on hover/click.
+    if (opts.showLabel) {
+      var labelText = point.city || point.country || point.ip;
+      L.circleMarker(from, {
+        radius: 4, color: opts.color, fillColor: opts.color,
+        fillOpacity: 0.55, weight: 1.5, opacity: 0.9,
+      }).addTo(map)
+        .bindPopup(popupHtml)
+        .bindTooltip(labelText, {
+          permanent: true, direction: 'right', offset: [6, 0],
+          className: 'flow-label ' + opts.labelClass,
+        });
+    }
+
+    var marker = L.circleMarker(from, {
+      radius: opts.dotRadius, color: opts.color, fillColor: opts.color,
+      fillOpacity: 1, weight: 0,
+    }).addTo(map);
+    marker.bindPopup(popupHtml);
+    marker.on('mouseover', function () { marker.openPopup(); });
+
+    var durationMs = speedFor(point.pps, opts.maxMs, opts.minMs);
+    var startOffset = Math.random() * durationMs;
+
+    function animate(ts) {
+      var t = ((ts + startOffset) % durationMs) / durationMs;
+      marker.setLatLng(lerpOnMap(from, to, t));
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  }
+
+  ATTACK_POINTS.forEach(function (p) {
+    addFlow(p, {
+      color: '#F0795A', lineWeight: 1.5, lineOpacity: 0.35,
+      dotRadius: 5, maxMs: 3200, minMs: 700, label: 'Attacks',
+      showLabel: true, labelClass: 'attack-label',
+    });
+  });
+
+  NORMAL_POINTS.forEach(function (p) {
+    addFlow(p, {
+      color: '#FAFAFA', lineWeight: 1, lineOpacity: 0.15,
+      dotRadius: 3, maxMs: 4200, minMs: 1800, label: 'Packets',
+      showLabel: true, labelClass: 'normal-label',
+    });
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
 with tab4:
     st.subheader("Global Threat Origin Map")
 
@@ -3309,85 +4270,72 @@ with tab4:
     else:
         df_results = st.session_state["pcap_results"]
         attacks = df_results[df_results["Severity"] != "Safe"]
+        normal  = df_results[df_results["Severity"] == "Safe"]
 
-        if attacks.empty:
-            st.success("No threats to map — all analysed traffic appears normal.")
+        if attacks.empty and normal.empty:
+            st.info("No flows to map yet.")
         else:
             st.info("Resolving IP locations… (private IPs are skipped)")
-            locations = []
-            unique_ips = attacks["Src IP"].unique()
+
+            # Normal-traffic IPs are capped so a mixed-traffic capture can't
+            # burn through the free ip-api.com lookup's rate limit — attacker
+            # IPs matter more for this feature and are never capped.
+            _NORMAL_IP_CAP = 15
+            attack_counts = attacks["Src IP"].value_counts()
+            normal_counts = normal["Src IP"].value_counts().head(_NORMAL_IP_CAP)
+
+            jobs = [(ip, "attack") for ip in attack_counts.index] + \
+                   [(ip, "normal") for ip in normal_counts.index]
+
+            attack_points, normal_points = [], []
             progress = st.progress(0)
-            for i, ip in enumerate(unique_ips):
+            for i, (ip, kind) in enumerate(jobs):
                 loc = get_ip_location(ip)
                 if loc:
-                    ip_attacks = attacks[attacks["Src IP"] == ip]
-                    loc["severity"] = ip_attacks["Severity"].iloc[0]
-                    loc["attacks"] = len(ip_attacks)
-                    locations.append(loc)
-                progress.progress((i + 1) / len(unique_ips))
+                    src_df = attacks if kind == "attack" else normal
+                    ip_rows = src_df[src_df["Src IP"] == ip]
+                    counts = attack_counts if kind == "attack" else normal_counts
+                    # Peak packet rate drives the flow's animation speed below —
+                    # a DDoS flood should visibly race in faster than a slow scan.
+                    point = {
+                        "ip": ip, "lat": loc["lat"], "lon": loc["lon"],
+                        "country": loc.get("country") or "Unknown",
+                        "city": loc.get("city") or "",
+                        "weight": int(counts[ip]),
+                        "pps": float(ip_rows["Pkts/s"].max()) if "Pkts/s" in ip_rows else 0.0,
+                    }
+                    if kind == "attack" and "Reason" in ip_rows:
+                        point["reason"] = str(ip_rows["Reason"].mode().iloc[0])
+                    (attack_points if kind == "attack" else normal_points).append(point)
+                progress.progress((i + 1) / max(len(jobs), 1))
             progress.empty()
 
-            if locations:
-                df_map = pd.DataFrame(locations)
-                # Monitored-network anchor the trajectory arcs converge on.
-                _SOC_LAT, _SOC_LON = 1.3521, 103.8198
-                fig_map = px.scatter_geo(
-                    df_map, lat="lat", lon="lon", hover_name="ip",
-                    hover_data={
-                        "country": True, "city": True, "isp": True,
-                        "attacks": True, "lat": False, "lon": False,
-                    },
-                    color_discrete_sequence=["#F0795A"], size="attacks",
-                    size_max=30, title="Attack Origins",
+            if attack_points or normal_points:
+                # Fixed illustrative anchor every flow animates toward — not
+                # real self-geolocation, matches the point Aalok's dashboard
+                # already converged arcs on (previously labelled "SOC").
+                _ANCHOR_LAT, _ANCHOR_LON = 1.3521, 103.8198
+
+                _map_html = (
+                    _THREAT_FLOW_MAP_TEMPLATE
+                    .replace("__ANCHOR_LAT__", str(_ANCHOR_LAT))
+                    .replace("__ANCHOR_LON__", str(_ANCHOR_LON))
+                    .replace("__ATTACK_POINTS__", json.dumps(attack_points))
+                    .replace("__NORMAL_POINTS__", json.dumps(normal_points))
                 )
-                # Glowing trajectory arcs: every attacker great-circles into
-                # the SOC anchor — a wide faint stroke under a narrower mid
-                # layer under a bright core reads as a neon glow.
-                for _, _arc in df_map.iterrows():
-                    for _w, _op in ((7, 0.10), (3.5, 0.22), (1.4, 0.85)):
-                        fig_map.add_trace(go.Scattergeo(
-                            lat=[_arc["lat"], _SOC_LAT],
-                            lon=[_arc["lon"], _SOC_LON],
-                            mode="lines",
-                            line=dict(width=_w, color=f"rgba(217,119,87,{_op})"),
-                            hoverinfo="skip", showlegend=False,
-                        ))
-                fig_map.add_trace(go.Scattergeo(
-                    lat=[_SOC_LAT], lon=[_SOC_LON], mode="markers+text",
-                    marker=dict(size=13, color="#97C0A4", symbol="diamond",
-                                line=dict(width=1.5, color="#FAF9F5")),
-                    text=["SOC"], textposition="top center",
-                    textfont=dict(color="#FAF9F5", size=11),
-                    hovertext=["Monitored network (SOC)"], hoverinfo="text",
-                    showlegend=False,
-                ))
-                fig_map.update_layout(
-                    geo=dict(
-                        showframe=False, showcoastlines=True,
-                        projection_type="natural earth",
-                        bgcolor="#1A1918",
-                        showland=True, landcolor="#1E1D1B",
-                        showocean=True, oceancolor="#141413",
-                        lakecolor="#141413",
-                        coastlinecolor="#3A3733",
-                        showcountries=True, countrycolor="#2B2A28",
-                    ),
-                    paper_bgcolor="#1A1918",
-                    font=dict(family="Inter, sans-serif", color="#C9C7BE"),
-                    title_font=dict(family="Source Serif 4, Georgia, serif",
-                                    color="#FAF9F5", size=18),
-                    height=520, margin=dict(l=0, r=0, t=48, b=0),
-                    legend=dict(bgcolor="rgba(0,0,0,0)"),
-                )
-                st.plotly_chart(fig_map, use_container_width=True)
+                components.html(_map_html, height=560)
 
                 st.markdown('<p class="threat-header">Attacker Details</p>', unsafe_allow_html=True)
-                st.dataframe(
-                    df_map[["ip", "country", "city", "isp", "attacks"]],
-                    width="stretch",
-                )
+                if attack_points:
+                    st.dataframe(
+                        pd.DataFrame(attack_points)[["ip", "country", "city", "weight"]]
+                          .rename(columns={"weight": "attacks"}),
+                        width="stretch",
+                    )
+                else:
+                    st.caption("No attacker IPs resolved to a public location for this capture.")
             else:
-                st.warning("All attacker IPs are private/local — no locations to map.")
+                st.warning("All source IPs are private/local — no locations to map.")
                 st.info("Try a PCAP with public source IPs for the map to populate.")
 
 
@@ -3432,9 +4380,26 @@ with tab5:
         except Exception as _lstm_exc:
             st.caption(f"LSTM unavailable: {_lstm_exc}")
 
+        # ── LSTM explainability ───────────────────────────────────────────────
+        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<p class="threat-header">LSTM SHAP Explainability</p>', unsafe_allow_html=True)
+        render_lstm_shap_panel()
+
         # ── Automated retraining ──────────────────────────────────────────────
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         st.markdown('<p class="threat-header">Automated Retraining</p>', unsafe_allow_html=True)
+        if _IS_DESKTOP_APP:
+            # The one-file build unpacks Dashboard/ to a private temp folder that
+            # Windows deletes when the window closes, and a retrain writes the new
+            # rf_model.pkl straight back into it. So it genuinely retrains and the
+            # panel genuinely reports success — the model is just gone next launch.
+            # Say so up front rather than let someone retrain, restart, and wonder
+            # why the version history is empty.
+            st.info(
+                "Retraining works here, but the retrained model lasts only until "
+                "this window is closed — the packaged app runs from a temporary "
+                "folder. Run the dashboard from source to keep a retrained model."
+            )
         render_retrain_panel()
 
 with tab6:
@@ -3601,3 +4566,217 @@ with tab6:
                 )
             except Exception as _test_exc:
                 st.error(f"Test send failed: {_test_exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 7 — DETECTION BENCHMARK
+# ═══════════════════════════════════════════════════════════════════════════
+# "How often is the model right?", answered against labelled ground truth.
+#
+# Deliberately separate from the Model Intelligence tab: that tab explains why
+# a single decision was made (SHAP, LSTM sequence view) and covers the LSTM.
+# This one measures how often the RANDOM FOREST is right across a whole
+# labelled dataset — a different model and a different question, so it gets
+# its own tab rather than crowding that one.
+#
+# The evaluation itself lives in evaluate_benchmark.py (same folder, also
+# runnable as a CLI). Nothing here recomputes a metric.
+with tab7:
+    st.subheader("Detection Benchmark")
+    st.markdown(
+        "Scores the Random Forest classifier against a **labelled** benchmark "
+        "dataset — CIC-IDS-2017 / 2018 style, or any CSV with flow features "
+        "plus a ground-truth `Label` column — and checks the result against "
+        "this project's stated performance targets."
+    )
+
+    if not BENCHMARK_OK:
+        st.warning(
+            "The benchmark module could not be loaded "
+            "(evaluate_benchmark.py missing from the Dashboard folder)."
+        )
+    else:
+        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="threat-header">Performance Targets</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "These are the targets the project is measured against. A run has "
+            "to clear every one of them to count as a pass."
+        )
+        _target_rows = []
+        for _k, (_label, _target, _lower, _unit) in _bench.SPEC_TARGETS.items():
+            _shown = f"{_target*100:.0f}%" if _unit == "%" else f"{_target:.0f} ms"
+            _target_rows.append({
+                "Metric": _label,
+                "Target": f"{'below' if _lower else 'at least'} {_shown}",
+            })
+        st.dataframe(pd.DataFrame(_target_rows), width="stretch", hide_index=True)
+
+        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="threat-header">Run a Benchmark</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "The CSV needs a `Label` column (`BENIGN` for normal traffic, the "
+            "attack name otherwise). Standard CIC-IDS column names are mapped "
+            "automatically; any feature the file does not carry is treated as "
+            "zero, so a partial column set still runs — it just measures the "
+            "model on less information."
+        )
+
+        _bench_file = st.file_uploader(
+            "Labelled benchmark CSV", type=["csv"], key="benchmark_csv"
+        )
+
+        if _bench_file is not None:
+            _res = None
+            try:
+                with st.spinner("Scoring the model against ground truth..."):
+                    _bench_df = pd.read_csv(_bench_file, low_memory=False)
+                    _res = _bench.evaluate_dataframe(_bench_df)
+            except _bench.BenchmarkError as _bexc:
+                st.error(f"Could not evaluate this file: {_bexc}")
+            except Exception as _bexc:
+                st.error(f"Unexpected error while evaluating: {_bexc}")
+
+            if _res:
+                st.success(
+                    f"Scored {_res['rows']:,} flows — "
+                    f"{_res['attack_rows']:,} attack, "
+                    f"{_res['benign_rows']:,} benign."
+                )
+
+                # ── Headline: one gauge per spec target ───────────────────
+                st.markdown(
+                    '<p class="threat-header" style="margin-top:14px;">Results '
+                    'vs Targets</p>',
+                    unsafe_allow_html=True,
+                )
+                _metric_keys = ["detection_rate", "false_positive",
+                                "precision", "f1", "latency_ms"]
+                _cols = st.columns(len(_metric_keys))
+                for _col, _key in zip(_cols, _metric_keys):
+                    _label, _target, _lower, _unit = _bench.SPEC_TARGETS[_key]
+                    _val = _res[_key]
+                    _ok = _bench.passes(_key, _val)
+                    if _unit == "%":
+                        _shown = f"{_val*100:.2f}%"
+                        _target_txt = f"{'<' if _lower else '>'} {_target*100:.0f}%"
+                    else:
+                        _shown = f"{_val:.3f} ms"
+                        _target_txt = f"< {_target:.0f} ms"
+                    _col.metric(
+                        _label, _shown,
+                        f"{'PASS' if _ok else 'FAIL'} · target {_target_txt}",
+                        delta_color="normal" if _ok else "inverse",
+                    )
+
+                _all_pass = all(_bench.passes(_k, _res[_k]) for _k in _metric_keys)
+                if _all_pass:
+                    st.success("All performance targets met on this dataset.")
+                else:
+                    _failed = [_bench.SPEC_TARGETS[_k][0] for _k in _metric_keys
+                               if not _bench.passes(_k, _res[_k])]
+                    st.warning(
+                        "Below target on: " + ", ".join(_failed) + ". "
+                        "The per-attack table below shows which attack types "
+                        "are responsible."
+                    )
+
+                # ── Confusion matrix ──────────────────────────────────────
+                st.markdown(
+                    '<p class="threat-header" style="margin-top:14px;">'
+                    'Confusion Matrix</p>',
+                    unsafe_allow_html=True,
+                )
+                _cm = pd.DataFrame(
+                    [[_res['tp'], _res['fn']], [_res['fp'], _res['tn']]],
+                    index=["Actually Attack", "Actually Benign"],
+                    columns=["Flagged Attack", "Flagged Benign"],
+                )
+                _cm_col, _cm_note = st.columns([2, 3])
+                _cm_col.dataframe(_cm, width="stretch")
+                _cm_note.markdown(
+                    f"- **{_res['tp']:,} caught** — attacks correctly flagged.\n"
+                    f"- **{_res['fn']:,} missed** — attacks that slipped through. "
+                    f"This is the number that matters most; a miss is an "
+                    f"intrusion nobody sees.\n"
+                    f"- **{_res['fp']:,} false alarms** — benign traffic flagged. "
+                    f"Costly in a different way: they train analysts to ignore "
+                    f"the dashboard.\n"
+                    f"- **{_res['tn']:,} correctly ignored.**"
+                )
+
+                # ── Per-attack detection rate ─────────────────────────────
+                _per_attack = _res.get('per_attack')
+                if _per_attack is not None and len(_per_attack):
+                    st.markdown(
+                        '<p class="threat-header" style="margin-top:14px;">'
+                        'Detection Rate by Attack Type</p>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "Worst first. The headline Detection Rate averages every "
+                        "attack type together, which can hide a class the model "
+                        "misses outright — this splits it back out."
+                    )
+                    _pa_display = _per_attack.copy()
+                    _pa_display["Detection Rate"] = (
+                        _pa_display["Detection Rate"] * 100
+                    ).map(lambda v: f"{v:.2f}%")
+                    st.dataframe(_pa_display, width="stretch", hide_index=True)
+
+                    _blind = _per_attack[_per_attack["Detection Rate"] == 0]
+                    if len(_blind):
+                        st.error(
+                            "Missed entirely: "
+                            + ", ".join(_blind["Attack Type"].tolist())
+                            + ". The model has no detection capability for "
+                            "these on this dataset."
+                        )
+
+                # ── Export ────────────────────────────────────────────────
+                st.markdown(
+                    '<p class="threat-header" style="margin-top:14px;">Export</p>',
+                    unsafe_allow_html=True,
+                )
+                _summary_rows = [{
+                    "Metric": _bench.SPEC_TARGETS[_k][0],
+                    "Value": (f"{_res[_k]*100:.4f}"
+                              if _bench.SPEC_TARGETS[_k][3] == "%"
+                              else f"{_res[_k]:.4f}"),
+                    "Unit": _bench.SPEC_TARGETS[_k][3],
+                    "Target": _bench.SPEC_TARGETS[_k][1],
+                    "Result": "PASS" if _bench.passes(_k, _res[_k]) else "FAIL",
+                } for _k in _metric_keys]
+                _summary_rows += [
+                    {"Metric": "True Positives", "Value": _res['tp'],
+                     "Unit": "flows", "Target": "", "Result": ""},
+                    {"Metric": "False Negatives", "Value": _res['fn'],
+                     "Unit": "flows", "Target": "", "Result": ""},
+                    {"Metric": "False Positives", "Value": _res['fp'],
+                     "Unit": "flows", "Target": "", "Result": ""},
+                    {"Metric": "True Negatives", "Value": _res['tn'],
+                     "Unit": "flows", "Target": "", "Result": ""},
+                ]
+                _bench_csv = pd.DataFrame(_summary_rows).to_csv(
+                    index=False).encode("utf-8")
+                st.download_button(
+                    "Download results (.csv)",
+                    _bench_csv,
+                    file_name="detection_benchmark_results.csv",
+                    mime="text/csv",
+                    key="benchmark_export",
+                )
+
+                with st.expander("Full classification report"):
+                    st.code(_res['classification_report'], language="text")
+        else:
+            st.info(
+                "Upload a labelled CSV to score the model. The same evaluation "
+                "runs from a terminal with "
+                "`python evaluate_benchmark.py <file.csv>`."
+            )

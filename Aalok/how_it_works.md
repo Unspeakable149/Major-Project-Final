@@ -49,11 +49,13 @@ This document is the long-form companion to `README.md`. It walks through the en
    │   Layer 2 — Random Forest      (predict + predict_proba)            │
    │   Layer 3 — Rolling state      (slow_attack_check, 15×2s history)   │
    │   Layer 4 — DNS-tunnel check   (T1071.004, > 30 DNS pps/window)     │
-   │   Layer 5 — Baseline whitelist (force Baseline for known-good IPs)  │
-   │   Layer 6 — Threat intel feed  (force Severe for known-malicious)   │
+   │   Layer 5 — LSTM sequence      (15-window verdict, capped)          │
+   │   Layer 6 — Baseline whitelist (force Baseline for known-good IPs)  │
+   │   Layer 7 — Threat intel feed  (force Severe for known-malicious)   │
    │                                                                     │
    │   Final precedence:                                                 │
-   │   intel  >  baseline  >  dns_tunnel  >  slow  >  fuse(rule, RF)     │
+   │   intel > baseline > dns_tunnel > slow > fuse(rule, RF, LSTM*)      │
+   │   (* LSTM contribution capped — see §4.5)                           │
    └─────────────────────────────────────────────────────────────────────┘
                 │                                              │
                 ▼                                              ▼
@@ -139,7 +141,9 @@ The brain of the runtime system. Single file, ~700 lines. Highlights:
 | `dns_tunnel_check(per_protocol_rows)` | Layer 4 — fires when DNS packets from one source exceed 30 / window. |
 | `write_protocol_breakdown(per_proto_df)` | Persists per-(IP, protocol) counts to `protocol_breakdown` table. |
 | `fuse(*threats)` | Picks the max severity from a tuple of threat strings. |
-| `write_alerts(...)` | The fusion engine — runs Layers 1-6 per flow, writes one row to `live_threat_logs`, fires the notifier on Severe verdicts. **All flows in a window are batch-scored** via a single `model.predict / predict_proba` call. |
+| `_load_lstm_safe()` / `_lstm_predict_scaled(...)` | Layer 5 — loads `Megan/lstm_model.py` if PyTorch is present, then returns a 15-window sequence verdict per source IP. Never raises; absent torch simply disables the layer. |
+| `apply_lstm_cap(...)` | Folds the LSTM verdict into `fuse()`'s inputs, downgrading an unconfirmed or partial-history Severe to Moderate. |
+| `write_alerts(...)` | The fusion engine — runs Layers 1-7 per flow, writes one row to `live_threat_logs`, fires the notifier on Severe verdicts. **All flows in a window are batch-scored** via a single `model.predict / predict_proba` call. |
 | `replay_pcap(...)` | Walks a static PCAP in 2s windows by `frame.time_epoch`, runs the full pipeline, prints a SUMMARY banner at the end. With `--realtime`, sleeps 2s between windows for video demos. |
 | `main()` | Loads model + DB + intel + baseline, dispatches between live mode and `--replay` mode. |
 
@@ -233,29 +237,43 @@ Thresholds were tuned empirically against the Bulk PCAPS corpus + Kali nmap/hpin
 - If any source IP's DNS packets exceed `30 packets / WINDOW_SECONDS = 15 pps`, the verdict is flagged **DNS Tunnel / C2 Channel — Moderate (Suspicious)**.
 - Mapped to MITRE ATT&CK T1071.004 (Application Layer Protocol: DNS) — covers DNS-over-application-layer C2 channels.
 
-### 4.5 Layer 5 — Baseline Whitelist (`baseline.txt`)
+### 4.5 Layer 5 — LSTM Sequence Model (`_lstm_predict_scaled` / `apply_lstm_cap`)
+
+- A 2-layer LSTM (`Megan/lstm_model.py`) reads the last **15 capture windows (≈ 30 s)** of the *same 18 scaled features* the Random Forest sees, kept per source IP in `_lstm_buffers` (LRU-bounded to `MAX_TRACKED_IPS`, like `ROLLING_STATE`).
+- It votes once it has ≥ 2 windows; shorter histories are left-padded with zeros, and `has_full_history` records whether the sequence was complete.
+- Its **raw** verdict is always logged to `sig_lstm`, but what it may contribute to the fused level is **capped** by `apply_lstm_cap()`:
+  - Baseline / Moderate → folded in as-is (the LSTM alone can raise Baseline → Moderate, which is the slow-scan case it exists to catch).
+  - Severe → only counted as Severe when the buffer holds a full 15-window sequence **and** some other layer independently reached Moderate+. Otherwise it is downgraded to Moderate.
+- Rationale for the cap: unlike the RF, this model has no drift/accuracy monitoring, and a 4-second buffer is enough for it to vote — so it is not allowed to trigger the top severity band unilaterally.
+- Optional: if PyTorch or `lstm_model.pt` is missing, the layer is skipped entirely and the other four behavioural layers are unaffected. Both ship in the packaged `.exe`, so it runs there too — earlier builds excluded `torch` for size and quietly lost this layer.
+
+### 4.6 Layer 6 — Baseline Whitelist (`baseline.txt`)
 
 - Newline-separated known-good IPs (gateway / DNS / dashboard host). `#` lines are comments.
 - Force-classifies matching source IPs as **Baseline (Safe) — Whitelisted Source** regardless of rule trips or RF prediction.
 - Eliminates false positives from speed tests, Windows Update bursts, etc. on infrastructure you control.
 - Optional; missing file → empty set.
 
-### 4.6 Layer 6 — Threat Intelligence Feed (`threat_intel.txt`)
+### 4.7 Layer 7 — Threat Intelligence Feed (`threat_intel.txt`)
 
 - Newline-separated known-malicious IPs (e.g. AbuseIPDB / FireHOL / Emerging Threats / Spamhaus DROP).
 - Force-escalates matching source IPs to **Severe (Critical Anomaly) — Known Malicious IP (Threat Intel Match)** regardless of behavioural metrics.
 - Optional; missing file → empty set.
 
-### 4.7 Precedence (Final Verdict Selection)
+### 4.8 Precedence (Final Verdict Selection)
 
 ```
-intel  >  baseline  >  dns_tunnel  >  slow  >  fuse(rule, RF)
+intel  >  baseline  >  dns_tunnel  >  slow  >  lstm  >  fuse(rule, RF, LSTM)
 ```
 
 Concretely (from `write_alerts()`):
 
 ```python
-threat = fuse(rf_threat, heuristic_threat, slow_threat, dns_threat)
+fuse_inputs, effective_lstm_threat = apply_lstm_cap(
+    [rf_threat, heuristic_threat, slow_threat, dns_threat],
+    lstm_threat, lstm_full_history,
+)
+threat = fuse(*fuse_inputs)
 if intel_hit:
     threat = "Severe (Critical Anomaly)"
     profile = "Known Malicious IP (Threat Intel Match)"
@@ -266,11 +284,15 @@ elif dns_hit:
     profile = "DNS Tunnel / C2 Channel"
 elif slow_hit and SEVERITY_RANK[slow_threat] >= SEVERITY_RANK[threat]:
     profile = slow_profile
+elif (effective_lstm_threat and effective_lstm_threat != "Baseline (Safe)"
+      and SEVERITY_RANK[effective_lstm_threat] >= SEVERITY_RANK[threat]):
+    profile = "LSTM Sequence Anomaly (multi-window)"
 ```
 
 - Threat intel always wins — a known-malicious IP that also appears on the whitelist still ends up Severe.
-- Baseline only overrides rule/RF/slow elevations — it never silences intel.
-- DNS-tunnel and slow profiles are surfaced as the `traffic_profile` string when they win the precedence battle so the dashboard shows *why* the verdict was Moderate.
+- Baseline only overrides rule/RF/slow/LSTM elevations — it never silences intel.
+- DNS-tunnel, slow and LSTM profiles are surfaced as the `traffic_profile` string when they win the precedence battle so the dashboard shows *why* the verdict was Moderate.
+- The LSTM sits last among the behavioural profiles: it only names the profile when nothing more specific already explained the same severity.
 
 ---
 

@@ -1,9 +1,37 @@
-streamlit
-pandas
-numpy
-joblib
-requests
-plotly
-scapy
-matplotlib
-scikit-learn
+# Hybrid IDS — pinned dependencies
+#
+# Exact versions the project was built and verified against (Python 3.14.5).
+# Pinned rather than left floating so a fresh `pip install -r requirements.txt`
+# reproduces a known-good environment instead of pulling whatever is latest
+# on the day.
+#
+# scikit-learn is the load-bearing pin: the shipped models (rf_model.pkl,
+# rf_scaler.pkl, ids_model_live.pkl) are pickled with _sklearn_version 1.8.0.
+# Loading them under a different scikit-learn raises InconsistentVersionWarning
+# and can fail to unpickle — which would silently drop the Random Forest and
+# fall back to the K-Means model. Retrain the models if you change this pin.
+#
+# streamlit is pinned because the dashboard is verified on 1.57.0. Streamlit
+# removes deprecated APIs on a schedule (st.components.v1.html was already past
+# its stated removal date and had to be migrated to st.iframe), so an unpinned
+# upgrade is a live breakage risk.
+#
+# To upgrade deliberately: bump one pin, run `python -m pytest tests/ -v` from
+# Aalok/, then launch the dashboard and confirm every tab still renders.
+
+streamlit==1.57.0
+pandas==3.0.2
+numpy==2.4.4
+joblib==1.5.3
+requests==2.33.1
+plotly==6.8.0
+scapy==2.7.0
+matplotlib==3.10.9
+scikit-learn==1.8.0
+python-docx==1.2.0   # Word export for the Threat/Management reports (docx_report.py)
+
+# Test-only. Not needed to run the IDS; needed to run `python -m pytest` over
+# tests/ (rules.py, scoring.py, offender_history.py, report.py). Left
+# unpinned-to-a-minor because pytest holds its public API stable across 8.x
+# and these tests use nothing version-sensitive.
+pytest>=8.0
