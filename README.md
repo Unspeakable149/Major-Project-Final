@@ -241,12 +241,39 @@ reproduce exactly.
 
 ## Credits
 
-| | |
-|---|---|
-| **Aalok** | Detection engine, live capture pipeline, threat scoring, Streamlit dashboard, desktop build |
-| **Rui Yang** | Offline PCAP analysis engine, signature rules, offender scoring, reporting |
-| **Aaron** | MITRE ATT&CK technique mapping |
-| **Megan** | LSTM sequence model, SHAP explainability, retraining pipeline |
+**Aalok — project lead, detection engine and platform.** 62 of the project's 85
+features, and the application every other contribution plugs into.
+
+- The live detection engine (`live_backend.py`, 1,856 lines): tshark capture loop,
+  2-second windowing, flow engineering, the heuristic rule engine, multi-window
+  rolling state for slow attacks, the DNS-tunnel detector, the threat-intel feed,
+  the baseline whitelist, and the fusion logic that reconciles every layer's verdict
+- The 0–100 threat scoring system — severity, frequency, behaviour, historical and
+  confidence components, false-positive gating, risk banding, and the plain-English
+  analyst report ([THREAT_SCORING.md](Aalok/THREAT_SCORING.md))
+- The Streamlit dashboard (`app.py`, 4,782 lines) — the host application. All seven
+  tabs, including the ones presenting the other three contributors' modules, plus
+  live telemetry, the firewall integration and auto-blocking
+- The Random Forest training and benchmark pipeline, PCAP replay mode, the
+  multi-channel alert notifier, and the 18-feature flow engineering all four
+  detection layers consume
+- The cross-platform desktop build: native-window launcher, PyInstaller recipe,
+  and the release packaging
+- The test and evidence base — the pytest suite, the six live Kali attack tests,
+  the spec-metric reproduction, and the honest per-feature audit of all four
+  contributors' work
+
+| Contributor | Scope | Features | Python |
+|---|---|---|---|
+| **Aalok** | Detection engine, threat scoring, dashboard host, desktop build, test suite | **62** | **8,831 lines** |
+| **Rui Yang** | Offline PCAP analysis engine, signature rules, offender scoring, reporting | 9 | 3,843 lines |
+| **Megan** | LSTM sequence model, SHAP explainability, retraining pipeline | 8 | 1,608 lines |
+| **Aaron** | MITRE ATT&CK technique mapping | 6 | 2,431 lines |
+
+Feature counts and their WORKS / PARTIAL / BROKEN verdicts come from
+[FEATURE-TEST-REPORT.md](FEATURE-TEST-REPORT.md), which audits every contributor
+on the same evidence standard. Line counts are the Python tracked in this
+repository.
 
 Coursework submission, published for review. No reuse licence is granted — see
 [SECURITY.md](SECURITY.md) for the terms it should be run under.
