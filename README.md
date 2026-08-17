@@ -16,6 +16,7 @@ Temasek Polytechnic.
 | **Want to run it?** | **[docs/INSTALL.md](docs/INSTALL.md)** → **[docs/USAGE.md](docs/USAGE.md)** |
 | **Reviewing the engineering?** | **[Aalok/how_it_works.md](Aalok/how_it_works.md)** and **[Test evidence](#test-evidence)** below |
 | **Just want the app?** | [**Releases**](https://github.com/Unspeakable149/Major-Project-Final/releases) — prebuilt Windows `.exe`, no Python needed |
+| **Want to watch it run?** | [**Demo recordings**](https://drive.google.com/drive/folders/18K5hzXV7r9_m2rRMbRn4Ig6tahfO8Ax1?usp=drive_link) — the system detecting live attacks end to end |
 
 ---
 
