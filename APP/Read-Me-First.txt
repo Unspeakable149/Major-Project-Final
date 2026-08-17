@@ -1,0 +1,94 @@
+====================================================================
+ HYBRID IDS  -  How to install and run
+====================================================================
+
+Hybrid IDS is a network Intrusion Detection System. It watches your
+network traffic in real time and flags suspicious activity (port
+scans, floods, brute-force, beaconing, etc.) in a live dashboard.
+
+You do NOT need Python or any coding tools. It is a single app.
+
+--------------------------------------------------------------------
+ WHAT YOU NEED
+--------------------------------------------------------------------
+ 1. Windows 11 (64-bit).
+ 2. Administrator rights on the PC (needed to capture packets).
+ 3. Wireshark installed  (one-time, free) -- see Step 1 below.
+
+--------------------------------------------------------------------
+ STEP 1  -  Install Wireshark (one time)
+--------------------------------------------------------------------
+ Hybrid IDS captures traffic using "tshark", which comes with
+ Wireshark. Wireshark also installs "Npcap", the driver that lets
+ the app see network packets.
+
+   * Download:  https://www.wireshark.org/download.html
+   * Run the installer and keep the DEFAULT options.
+   * When it offers to install "Npcap", say YES (leave it checked).
+
+ If Wireshark is already installed, skip this step.
+
+--------------------------------------------------------------------
+ STEP 2  -  Run Hybrid IDS
+--------------------------------------------------------------------
+ 1. Double-click  HybridIDS.exe
+
+ 2. If Windows shows a blue "Windows protected your PC" box:
+       - Click  "More info"
+       - Click  "Run anyway"
+    (This appears because the app is not code-signed. It is safe.)
+
+ 3. Click  "Yes"  on the "Do you want to allow this app to make
+    changes?" (User Account Control) prompt.
+       - Administrator is required to capture network packets and to
+         block malicious IPs in the Windows Firewall.
+
+ 4. The FIRST launch takes about 10-20 seconds (the app unpacks
+    itself). A window titled "Hybrid IDS" will open with the
+    dashboard. That's it.
+
+ 5. To STOP everything, just CLOSE the window. There is no separate
+    stop step -- capture and dashboard shut down together.
+
+--------------------------------------------------------------------
+ USING IT (quick tour)
+--------------------------------------------------------------------
+ * The "Live SOC Dashboard" shows detections as they happen.
+ * Use the buttons at the top to switch between views:
+     Live SOC Dashboard | Educational Simulator | PCAP Analysis |
+     Threat Map | Model Intelligence | Defense Config
+ * "How to use" (top-right) opens an in-app guide any time.
+
+ Tip: ordinary high-speed traffic (a big download, a video stream,
+ Windows Update, a CDN) can look like a "Severe High-Volume Flood".
+ Always check WHO the source IP is before trusting a Severe alert.
+
+--------------------------------------------------------------------
+ TROUBLESHOOTING
+--------------------------------------------------------------------
+ "Wireshark is required but was not found"
+     -> Do Step 1 (install Wireshark, including Npcap), then rerun.
+
+ Antivirus flags or removes HybridIDS.exe
+     -> This is a common FALSE POSITIVE for apps packaged this way.
+        Restore the file and allow/exclude it, then rerun. If the
+        file was truncated by antivirus, re-copy the original.
+
+ The window never opens / closes immediately
+     -> Make sure you clicked "Yes" on the UAC prompt.
+     -> Check the log file for details and send it to us:
+        %LOCALAPPDATA%\HybridIDS\desktop_server.log
+        (Paste that path into the File Explorer address bar.)
+
+ No detections appear
+     -> Generate some traffic (open websites, stream a video). The
+        engine analyzes traffic in 2-second windows.
+
+--------------------------------------------------------------------
+ NOTES
+--------------------------------------------------------------------
+ * Nothing is sent to the cloud. Everything runs locally on your PC.
+ * The app is fully self-contained -- no install, no Python needed.
+   You can keep HybridIDS.exe anywhere (Desktop, Downloads, a USB).
+ * Wireshark/tshark is the only separate requirement (Step 1).
+====================================================================

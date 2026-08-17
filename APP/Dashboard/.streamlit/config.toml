@@ -1,0 +1,20 @@
+# Dashboard theme — Anthropic dark: warm near-black, cream text, terracotta accent.
+# Custom typography and component styling live in the CSS block in app.py.
+[theme]
+base = "dark"
+primaryColor = "#D97757"
+backgroundColor = "#141413"
+secondaryBackgroundColor = "#1F1E1C"
+textColor = "#FAF9F5"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+# Bind to loopback only. The dashboard must never be reachable from the LAN or
+# the internet — it exposes live capture data and admin controls with no auth.
+[server]
+address = "127.0.0.1"
+headless = true
+enableCORS = true
+enableXsrfProtection = true

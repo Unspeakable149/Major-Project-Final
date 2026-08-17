@@ -1,0 +1,18 @@
+# Baseline Whitelist — known-good source IPs.
+#
+# One IPv4 address per line. Lines starting with '#' are comments.
+# Matching source IPs are forced to "Baseline (Safe)" regardless of
+# rule trips or RF prediction. Threat-intel matches still win — a
+# whitelist entry will not protect an IP that also appears on the
+# threat-intel feed.
+#
+# Typical entries: your gateway, DNS server, the dashboard host, any
+# device that legitimately bursts traffic during speed tests / OS
+# updates and trips bandwidth-spike rules.
+#
+# Copy this file to baseline.txt and edit. The runtime loads
+# baseline.txt only — this .example file is ignored.
+
+# 192.168.1.1     # home gateway / router
+# 192.168.1.10    # internal DNS resolver
+# 10.0.0.5        # dashboard host

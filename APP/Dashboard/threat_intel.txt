@@ -1,0 +1,17 @@
+# Hybrid IDS — Threat Intelligence Feed
+#
+# One IPv4 address per line. Lines starting with '#' are ignored.
+# Any captured source IP matching this list is automatically escalated to
+# "Severe (Critical Anomaly)" regardless of behavioral metrics, with the
+# traffic_profile labelled "Known Malicious IP (Threat Intel Match)".
+#
+# Suggested feed sources to populate from (replace these placeholders):
+#   - AbuseIPDB blocklist  (https://www.abuseipdb.com/)
+#   - FireHOL Level 1      (https://iplists.firehol.org/)
+#   - Emerging Threats     (https://rules.emergingthreats.net/)
+#   - Spamhaus DROP list   (https://www.spamhaus.org/drop/)
+#
+# RFC 5737 documentation-range examples (safe to leave here as placeholders):
+192.0.2.66
+198.51.100.7
+203.0.113.42

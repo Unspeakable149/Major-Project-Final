@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy this file to notifier_config.json and fill in real values. Real config is gitignored. Set enabled=true on any channel(s) you want active. Throttle window is 1 hour per (source IP, channel).",
+
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "use_tls": true,
+    "use_ssl": false,
+    "username": "your_alert_account@gmail.com",
+    "password": "your_app_password_here",
+    "from_addr": "your_alert_account@gmail.com",
+    "to_addrs": ["soc_team@example.com"]
+  },
+
+  "discord": {
+    "enabled": false,
+    "webhook_url": "https://discord.com/api/webhooks/XXXXXXXXX/YYYYYYYYY"
+  },
+
+  "slack": {
+    "enabled": false,
+    "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+  }
+}
