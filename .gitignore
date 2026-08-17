@@ -34,8 +34,11 @@ temp_raw.csv
 retrain_state.json
 launcher.log
 
-# Evidence captures auto-saved by the dashboard — named after real remote IPs
-Aalok/Dashboard/evidence/
+# Evidence captures auto-saved by the dashboard — named after real remote IPs.
+# Matched by directory name rather than by full path: the dashboard exists twice
+# (Aalok/Dashboard is canonical, APP/Dashboard is the patched desktop copy) and a
+# path-anchored rule silently covers only one of them.
+*/Dashboard/evidence/
 
 # ── Credentials and operator-specific config ─────────────────────────────────
 # Only the .example templates are published; see SECURITY.md.
@@ -46,13 +49,23 @@ baseline.txt
 # Large, regenerable, and derived from real captures. The one exception is
 # ai_ready_advanced_flows.csv, un-ignored below: reproduce_spec_metrics.py needs
 # it, and its Source IP column has been pseudonymised.
-Aalok/Dashboard/master_behavioral_dataset.csv
-Aalok/Dashboard/master_advanced_dataset.csv
-Aalok/Dashboard/model_versions/
-Aalok/Dashboard/Bulk PCAPS/
-Aalok/Dashboard/Temp_CSVs/
-Aalok/Dashboard/archive*/
+#
+# Matched by name, not by path, for the same reason as the evidence rule above:
+# both Dashboard copies carry these files, so anchoring to Aalok/Dashboard left
+# the APP/Dashboard copies of the real training data one `git add` from being
+# published.
+master_behavioral_dataset.csv
+master_advanced_dataset.csv
+model_versions/
+Bulk PCAPS/
+Temp_CSVs/
+archive*/
 *.preanon-backup
+
+# Pre-redaction copies of published documents. These hold exactly the network
+# identity that was scrubbed out of the released versions, so they must never be
+# staged — least of all by a reflexive `git add -A`.
+*.preredact-backup
 
 # ── Build output ─────────────────────────────────────────────────────────────
 build/
@@ -76,6 +89,10 @@ Aalok/Weeks/
 Aalok/Final Report and Slides/
 Backup/
 claude memory file/
+# The bundle handed in through Teams, plus the link notes that go with it. The
+# institutional submission is the channel for restricted material; none of it
+# belongs in the public mirror.
+Submission Made In Teams/
 *.mp4
 *.pptx
 *.docx
@@ -92,14 +109,22 @@ image (*).png
 
 # ── Un-ignored: shipped artifacts that collide with the rules above ──────────
 # Trained models the app loads at runtime. Without these a fresh clone starts
-# with no classifier and silently falls back to the K-Means model.
+# with no classifier and silently falls back to the K-Means model. Listed for
+# both dashboard copies — APP/Dashboard is what PyInstaller bundles into the exe,
+# so a clone missing those models cannot build the desktop app.
 !Aalok/Dashboard/rf_model.pkl
 !Aalok/Dashboard/rf_scaler.pkl
 !Aalok/Dashboard/advanced_data_scaler.pkl
 !Aalok/Dashboard/advanced_kmeans_model.pkl
 !Aalok/Dashboard/lstm_model.pt
+!APP/Dashboard/rf_model.pkl
+!APP/Dashboard/rf_scaler.pkl
+!APP/Dashboard/advanced_data_scaler.pkl
+!APP/Dashboard/advanced_kmeans_model.pkl
+!APP/Dashboard/lstm_model.pt
 !Rui Yang/models/*.pkl
 
 # Evidence behind the published metrics.
 !Aalok/Dashboard/ai_ready_advanced_flows.csv
+!APP/Dashboard/ai_ready_advanced_flows.csv
 !Aalok/TEST_RESULTS.md
